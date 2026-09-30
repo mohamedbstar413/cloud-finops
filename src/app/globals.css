@@ -65,3 +65,11 @@ pre code {
 .animate-pulse-soft {
   animation: pulse-soft 1.4s ease-in-out infinite;
 }
+
+/* Architecture diagram canvas: quiet dot grid */
+.diagram-canvas {
+  background-color: #fbfcfe;
+  background-image: radial-gradient(#e2e8f0 1px, transparent 1px);
+  background-size: 16px 16px;
+  background-position: -8px -8px;
+}

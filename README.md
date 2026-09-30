@@ -18,10 +18,18 @@ Other scripts: `npm run analyze` (print ranked recommendations in the terminal),
 ## Testing
 
 ```bash
-npm test               # 57 tests: engine, projection, schemas, complex architectures, fuzzing
+npm test               # 72 tests: engine, projection, schemas, complex architectures, diagrams, fuzzing
 npm run test:stress    # same suite with 10× more fuzz iterations (FUZZ_RUNS=10)
 npm run fuzz:seed -- 551   # reproduce a failing fuzz seed and print its recommendations
 ```
+
+`tests/diagram.test.ts` proves the diagram layout's guarantees on thousands of random multi-cloud graphs:
+
+- Nodes never overlap.
+- Each cloud's components stay inside its boundary, and boundaries never overlap.
+- Edges are orthogonal and never pass through a component.
+
+It also covers row wrapping, semantic auto-diagrams and the architecture diff.
 
 `tests/complex-architectures.test.ts` covers:
 
@@ -52,6 +60,7 @@ npm run fuzz:seed -- 551   # reproduce a failing fuzz seed and print its recomme
 | **What-if simulator** | Ask "what if we moved all possible workloads to serverless?" The AI turns the question into transforms and the simulator applies them in dependency order. You get savings by lever, spend by provider before and after, payback, and a list of workloads that are **not eligible, with the reason**. |
 | **Savings Projection page** | Cost-improvement charts for any suggested architecture, or for **any architecture you describe** (free text or component builder): a waterfall from today's spend, the trajectory with migration ramp and forecast growth, cumulative net savings with break-even, ROI and 3-year NPV. |
 | **Anomaly detection** | Weekday-seasonal robust z-score (median/MAD) per service. One-off spikes don't poison the baseline. Anomalies are reported as **spend at risk**, separately from run-rate savings. |
+| **Architecture diff diagrams** | Every proposal is drawn by a purpose-built layout engine: one boundary per cloud, crossing reduction, orthogonal edges routed through the gaps (never through a component), buses for many-to-many links, and per-component costs. **Side by side** or as a **unified diff** (removed components struck through, new ones highlighted, "moved from AWS"). Hover or focus a component for its pricing breakdown; expand to full screen or export as SVG. |
 | **Role-aware analysis of any architecture** | Free text or a component builder. Each tier (web, batch, stateful, k8s) only gets optimizations that are safe for it. Serverless is evaluated against a computed request **break-even**. Every assumption, estimated SKU rate and unpriced service is surfaced to the user. |
 
 ## Screens
@@ -85,6 +94,7 @@ src/
       whatif.ts               scenario simulator + offline keyword planner
       custom.ts               analysis of arbitrary architectures + free-text parser
       index.ts                runEngine() + overlap resolution
+    diagram/                  layout.ts (layered layout, cloud columns, orthogonal routing), diff.ts (architecture diff + cost linking)
     ai/                       OpenAI client, strict JSON schemas, advisor (enrich, discover, plan, narrate, analyze)
     connectors/               aws.ts (STS AssumeRole + Cost Explorer + EC2/CloudWatch), azure.ts (Cost Management + ARM),
                               gcp.ts (BigQuery billing export + Compute), demo.ts

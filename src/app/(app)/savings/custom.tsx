@@ -3,13 +3,14 @@
 import clsx from "clsx";
 import { Lightbulb, Plus, Sparkles, Trash2, TriangleAlert, Wand2 } from "lucide-react";
 import { useMemo, useState } from "react";
-import { ArchitectureDiagram } from "@/components/ArchitectureDiagram";
+import { ArchitectureCompare } from "@/components/diagram/ArchitectureCompare";
 import { api, inputClass, Notice, Select, Spinner } from "@/components/client-ui";
 import { CostBreakdown } from "@/components/CostBreakdown";
 import { ProjectionPanel } from "@/components/ProjectionPanel";
 import { ProviderLogo } from "@/components/ProviderLogo";
 import { buttonClass, Card, CardHeader, LevelText, Pill } from "@/components/ui";
 import type { CustomAnalysis, PricedProposal } from "@/lib/engine/custom";
+import type { ArchitectureSpec } from "@/lib/engine/types";
 import { autoDiagram } from "@/lib/engine/diagram";
 import { usd } from "@/lib/format";
 import { PRICES, PROVIDER_LABEL, VM_TYPES, type Provider } from "@/lib/pricing/catalog";
@@ -290,8 +291,14 @@ export function CustomArchitecture({ ai, growthRate }: { ai: boolean; growthRate
 
 function CustomResult({ result, pick, setPick, growthRate }: { result: CustomAnalysis & { notice?: string }; pick: number; setPick: (i: number) => void; growthRate: number }) {
   const proposal: PricedProposal | undefined = result.proposals[pick];
-  const currentDiagram = useMemo(() => autoDiagram(result.current.components), [result]);
-  const proposedDiagram = useMemo(() => (proposal ? autoDiagram(proposal.components, "added") : null), [proposal]);
+  const currentSpec = useMemo<ArchitectureSpec>(
+    () => ({ title: "Current", provider: result.current.components[0]?.provider ?? "aws", monthlyCost: result.current.monthlyCost, components: result.current.components, bullets: [], ...autoDiagram(result.current.components) }),
+    [result],
+  );
+  const proposedSpec = useMemo<ArchitectureSpec | null>(
+    () => (proposal ? { title: proposal.title, provider: proposal.targetProvider, monthlyCost: proposal.monthlyCost, components: proposal.components, bullets: [], ...autoDiagram(proposal.components) } : null),
+    [proposal],
+  );
   const inputs = useMemo(
     () =>
       proposal
@@ -368,19 +375,12 @@ function CustomResult({ result, pick, setPick, growthRate }: { result: CustomAna
         </div>
       )}
 
-      {proposal && proposedDiagram && (
+      {proposal && proposedSpec && (
         <>
           <Card>
             <CardHeader title={proposal.title} subtitle={proposal.rationale} />
-            <div className="grid gap-4 p-5 lg:grid-cols-2">
-              <div className="rounded-lg border border-line p-3">
-                <p className="mb-2 text-xs font-semibold text-muted">Current · {usd(result.current.monthlyCost)}/mo</p>
-                <ArchitectureDiagram nodes={currentDiagram.nodes} edges={currentDiagram.edges} />
-              </div>
-              <div className="rounded-lg border border-green-200 bg-green-50/30 p-3">
-                <p className="mb-2 text-xs font-semibold text-good">Proposed · {usd(proposal.monthlyCost)}/mo</p>
-                <ArchitectureDiagram nodes={proposedDiagram.nodes} edges={proposedDiagram.edges} />
-              </div>
+            <div className="p-5">
+              <ArchitectureCompare current={currentSpec} proposed={proposedSpec} bare title="Architecture" filename={`custom-${proposal.strategy}`} />
             </div>
             <div className="grid gap-6 border-t border-line p-5 lg:grid-cols-[2fr_1fr]">
               <CostBreakdown current={result.current.components} proposed={proposal.components} />

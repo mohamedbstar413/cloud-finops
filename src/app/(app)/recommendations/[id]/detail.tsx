@@ -5,7 +5,7 @@ import { ArrowDown, ArrowRight, ArrowUp, BrainCircuit, Check, ChevronDown, Circl
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { ArchitectureDiagram } from "@/components/ArchitectureDiagram";
+import { ArchitectureCompare } from "@/components/diagram/ArchitectureCompare";
 import { api, CodeBlock, inputClass, Modal, Notice, Spinner, Tabs } from "@/components/client-ui";
 import { CostBreakdown } from "@/components/CostBreakdown";
 import { ProjectionPanel } from "@/components/ProjectionPanel";
@@ -404,41 +404,7 @@ function ArchitectureComparison({ data }: { data: Data }) {
   const pro = details.proposed!;
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 lg:grid-cols-2">
-        <Card className="p-5">
-          <div className="flex items-center gap-2">
-            <span className="grid size-6 place-items-center rounded-full bg-amber-100 text-amber-600">!</span>
-            <p className="text-[13.5px] font-semibold">Current Architecture</p>
-            <ProviderLogo provider={cur.provider} size={14} />
-          </div>
-          <div className="mt-4">
-            <ArchitectureDiagram nodes={cur.nodes} edges={cur.edges} title="Current architecture" />
-          </div>
-          <div className="mt-4 rounded-lg bg-slate-50 px-4 py-3">
-            <p className="text-[11px] text-muted">Monthly cost</p>
-            <p className="text-[20px] font-semibold">{usd(cur.monthlyCost)}</p>
-          </div>
-        </Card>
-        <Card className="p-5">
-          <div className="flex items-center gap-2">
-            <span className="grid size-6 place-items-center rounded-full bg-green-100 text-green-600">
-              <Check size={13} />
-            </span>
-            <p className="text-[13.5px] font-semibold">Recommended Architecture</p>
-            <ProviderLogo provider={pro.provider} size={14} />
-          </div>
-          <div className="mt-4">
-            <ArchitectureDiagram nodes={pro.nodes} edges={pro.edges} title="Recommended architecture" />
-          </div>
-          <div className="mt-4 flex items-end justify-between rounded-lg bg-green-50/70 px-4 py-3">
-            <div>
-              <p className="text-[11px] text-muted">Monthly cost</p>
-              <p className="text-[20px] font-semibold">{usd(pro.monthlyCost)}</p>
-            </div>
-            <Pill className="bg-green-100 text-green-700 ring-green-200">{Math.round(rec.savingsPct)}% savings</Pill>
-          </div>
-        </Card>
-      </div>
+      <ArchitectureCompare current={cur} proposed={pro} filename={rec.fingerprint.replace(/[^a-z0-9]+/gi, "-").slice(0, 60)} />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>

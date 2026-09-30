@@ -120,6 +120,7 @@ export interface DiagramNode {
   layer: number;
   count?: number;
   provider?: Provider;
+  region?: string;
   highlight?: "removed" | "added" | "changed";
 }
 

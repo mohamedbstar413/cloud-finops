@@ -4,7 +4,7 @@ import clsx from "clsx";
 import { ArrowRight, Boxes, PenTool } from "lucide-react";
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ArchitectureDiagram } from "@/components/ArchitectureDiagram";
+import { ArchitectureCompare } from "@/components/diagram/ArchitectureCompare";
 import { WaterfallChart } from "@/components/charts";
 import { CostBreakdown } from "@/components/CostBreakdown";
 import { ProjectionPanel } from "@/components/ProjectionPanel";
@@ -163,15 +163,8 @@ function SingleArchitecture({ rec }: { rec: SavingsRec }) {
           </Link>
         }
       />
-      <div className="grid gap-4 p-5 lg:grid-cols-2">
-        <div className="rounded-lg border border-line p-3">
-          <p className="mb-2 text-xs font-semibold text-muted">Current · {usd(rec.current!.monthlyCost)}/mo</p>
-          <ArchitectureDiagram nodes={rec.current!.nodes} edges={rec.current!.edges} />
-        </div>
-        <div className="rounded-lg border border-green-200 bg-green-50/30 p-3">
-          <p className="mb-2 text-xs font-semibold text-good">Proposed · {usd(rec.proposed!.monthlyCost)}/mo</p>
-          <ArchitectureDiagram nodes={rec.proposed!.nodes} edges={rec.proposed!.edges} />
-        </div>
+      <div className="p-5">
+        <ArchitectureCompare current={rec.current!} proposed={rec.proposed!} bare title="Architecture" filename={rec.title.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 60)} />
       </div>
       <div className="border-t border-line p-5">
         <CostBreakdown current={rec.current!.components} proposed={rec.proposed!.components} />

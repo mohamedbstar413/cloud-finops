@@ -51,7 +51,8 @@ export function CodeBlock({ code, title, maxHeight = 520 }: { code: string; titl
   );
 }
 
-export function Modal({ open, onClose, title, children, wide }: { open: boolean; onClose: () => void; title: string; children: ReactNode; wide?: boolean }) {
+export function Modal({ open, onClose, title, children, wide, size }: { open: boolean; onClose: () => void; title: string; children: ReactNode; wide?: boolean; size?: "md" | "lg" | "xl" }) {
+  const width = size === "xl" ? "max-w-[min(1320px,96vw)]" : size === "lg" || wide ? "max-w-3xl" : "max-w-lg";
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -65,7 +66,7 @@ export function Modal({ open, onClose, title, children, wide }: { open: boolean;
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className={clsx("max-h-[90vh] w-full overflow-auto rounded-xl bg-white shadow-2xl", wide ? "max-w-3xl" : "max-w-lg")}
+        className={clsx("max-h-[92vh] w-full overflow-auto rounded-xl bg-white shadow-2xl", width)}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-line px-5 py-3.5">

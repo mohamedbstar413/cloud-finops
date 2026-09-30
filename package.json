@@ -12,12 +12,14 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:reset": "prisma db push --force-reset && tsx prisma/seed.ts",
     "setup": "prisma db push && tsx prisma/seed.ts",
+    "db:postgres:schema": "tsx scripts/prisma-postgres.ts",
     "analyze": "tsx scripts/analyze.ts",
     "postinstall": "prisma generate",
     "test": "tsx --test tests/*.test.ts",
     "test:stress": "FUZZ_RUNS=10 tsx --test tests/*.test.ts",
     "fuzz:seed": "tsx scripts/fuzz-seed.ts",
-    "worker": "tsx scripts/worker.ts"
+    "worker": "tsx scripts/worker.ts",
+    "keys:rotate": "tsx scripts/rotate-keys.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

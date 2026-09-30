@@ -6,22 +6,36 @@ Multi-cloud (AWS, Azure, GCP) cost optimization with an **AI Architecture Adviso
 
 ```bash
 npm install
-cp .env.example .env        # optionally add OPENAI_API_KEY
-npm run setup               # create SQLite schema + seed the "Acme Corp" demo estate
-npm run dev                 # http://localhost:3000
+cp .env.example .env        # optionally add OPENAI_API_KEY; set SEED_PASSWORD to sign in as the Acme users
+npm run setup               # create SQLite schema + seed the "Acme Corp" demo organization
+npm run dev                 # http://localhost:3000 (the background worker runs inside the dev server)
 ```
+
+Open the app and either **create an account** (`/signup`: your own organization, then onboarding connects a cloud account or loads sample data) or choose **Explore the live demo** on the sign-in page (a short, read-only visit to Acme Corp). There is no fallback user: without a session every page redirects to `/login`.
+
+In development, emails (invitations, password resets, notifications) are printed to the server log, so the links can be followed locally.
 
 The app works fully without an OpenAI key (rules mode). Add `OPENAI_API_KEY` to unlock the AI features (see [AI design](#ai-design)).
 
-Other scripts: `npm run analyze` (print ranked recommendations in the terminal), `npm run db:reset`, `npm run build`.
+Other scripts: `npm run analyze -- "<organization name or id>"` (print ranked recommendations in the terminal; default: the demo organization), `npm run worker`, `npm run keys:rotate`, `npm run db:reset`, `npm run build`.
 
 ## Testing
 
 ```bash
-npm test               # 171 tests: engine, usage over time, connectors, projection, schemas, complex architectures, diagrams, fuzzing
+npm test               # 202 tests: engine, usage over time, connectors, projection, schemas, complex architectures, diagrams, SaaS foundations, fuzzing
 npm run test:stress    # same suite with 10× more fuzz iterations (FUZZ_RUNS=10)
 npm run fuzz:seed -- 551   # reproduce a failing fuzz seed and print its recommendations (add --usage for the usage-history fuzz)
 ```
+
+`tests/saas.test.ts` runs against a real throwaway database (SQLite by default) and covers accounts and sessions (no fallback user, lockout after repeated failures), tenant isolation, invitations, password resets, the read-only demo, per-tenant encryption and master-key rotation, the job queue (no duplicates, one job per organization at a time, retries, crash recovery, the daily schedule), plan limits, settings, Stripe webhooks, and organization export and deletion. To run it on PostgreSQL:
+
+```bash
+npx prisma generate --schema prisma/postgres/schema.prisma
+TEST_POSTGRES_URL="postgresql://user@localhost:5432/anydb" npx tsx --test tests/saas.test.ts
+npx prisma generate      # back to the SQLite client
+```
+
+Each run creates its own schema (`test_saas_<pid>`) in that database and drops it afterwards; nothing else in the database is touched.
 
 `tests/diagram.test.ts` proves the diagram layout's guarantees on thousands of random multi-cloud graphs:
 
@@ -115,8 +129,16 @@ Every usage-based recommendation shows the history it used: daily charts with th
 | `/savings` | Cost-improvement charts for suggested improvements or any custom architecture |
 | `/cost-explorer` | Filters by provider, period, category, region, account and workload tag; donut, stacked bars, daily trend, sparkline table, CSV export |
 | `/accounts` | Connect AWS/Azure/GCP (or demo) accounts; sync, health test, read-only / read-write, disconnect; usage-history coverage per account and warnings for data a sync could not read |
-| `/organization` | Members, roles, invites, audit log, permission matrix, "view as" role preview |
-| `/settings` | Integration status, pricing catalog, usage-analysis rules, detector list |
+| `/signup`, `/login`, `/forgot-password`, `/invite/[token]` | Create an account and organization, sign in (or explore the read-only demo), reset a password, accept an invitation |
+| `/onboarding` | A new organization's first steps: connect a cloud account or load sample data, then the first analysis runs in the background |
+| `/organization` | Members, roles, email invitations, audit log, permission matrix |
+| `/billing` | Plan, usage against the plan's limits, upgrade (Stripe Checkout) and the customer portal |
+| `/settings` | Daily sync hour, integration status, pricing catalog, usage-analysis rules, detector list |
+| `/settings/remediation` | How changes reach your repository (branch, branch + pull request, or automatic apply of low-risk changes), branch prefix, allowed change types, backup retention, Git connection |
+| `/settings/notifications` | Emails for new high-impact savings and sync failures |
+| `/settings/data` | Export everything held about the organization; delete the organization |
+
+The sidebar switches between the organizations you belong to.
 
 ## Architecture
 
@@ -144,11 +166,23 @@ src/
                               azure.ts (Cost Management, ARM, Azure Monitor), gcp.ts (BigQuery billing export, Compute,
                               Cloud Storage, Cloud Monitoring), usage.ts (aligning and combining samples), demo.ts
     demo/usage.ts             deterministic usage history for the demo estate
-    services/                 ingestion (upsert by external id), analysis (fingerprint reconciliation), queries
+    services/                 ingestion (upsert by external id), analysis (fingerprint reconciliation), queries,
+                              auth (accounts, sessions, invitations, resets, demo visits), org-lifecycle (export, deletion)
+    auth.ts                   request-level session and RBAC (getSession / pageSession / requirePermission)
+    jobs/                     queue.ts (Postgres/SQLite-backed, de-duplicated), worker.ts (per-organization fairness, retries
+                              with backoff, crash recovery), scheduler.ts (daily sync at each organization's hour), handlers.ts
+    billing/                  plans.ts (Free / Pro / Enterprise limits), limits.ts (enforcement and usage meters), stripe.ts
+    settings.ts               per-organization settings with defaults (remediation, backups, sync, notifications, Git)
+    tenant-crypto.ts          per-organization data keys wrapped by the master key; master-key rotation
+    email.ts                  transactional email (Resend, or the server log in development)
     projection.ts             trajectories, break-even, ROI, NPV, waterfall
   app/(app)/…                 pages          app/api/…  route handlers
-prisma/schema.prisma          Organization, User, Membership(role), CloudAccount, Resource, UsageSeries, CostRecord,
-                              Recommendation, AnalysisRun, Ticket, Scenario, AuditLog, Invite
+  proxy.ts                    redirects visitors without a session to /login; refuses cross-site API writes
+  instrumentation.ts          starts the worker inside the dev server (WORKER_MODE=inline)
+prisma/schema.prisma          Organization, User, Session, Membership(role), CloudAccount, Resource, UsageSeries, CostRecord,
+                              Recommendation, AnalysisRun, Ticket, Scenario, AuditLog, Invite, Job, UsageCounter, …
+prisma/postgres/              the same model for PostgreSQL (generated) and its migrations
+scripts/                      worker.ts, rotate-keys.ts, analyze.ts, prisma-postgres.ts, fuzz-seed.ts
 ```
 
 **Pipeline:** connector → normalized `Resource` + its `UsageSeries` + daily `CostRecord` (FOCUS-style) → `runEngineWithCoverage()` → recommendations reconciled by **fingerprint**, plus an `AnalysisRun` that records usage coverage and what was held back. Re-analysis keeps your apply, dismiss and snooze decisions and any AI enrichment.
@@ -186,12 +220,29 @@ Some things no connector can measure today, and the engine says so instead of as
 
 ## Roles
 
-`owner` / `admin`: everything, including accounts and members. `member`: act on recommendations, run analysis, use AI. `viewer`: read-only. Permissions are enforced in every API route. The demo resolves the current user from a cookie (use "View as" on `/organization`). Replace `getSession()` in `src/lib/auth.ts` with Auth.js, Clerk or WorkOS for production.
+`owner` / `admin`: everything, including accounts and members. `member`: act on recommendations, run analysis, use AI. `viewer`: read-only. Only an owner can change the plan or delete the organization. Permissions are enforced in every API route.
+
+Sign-in is email and password: passwords are hashed with scrypt, repeated failures lock the address for a while, and unknown addresses get the same answer as wrong passwords. The session cookie holds a random token; only its SHA-256 is stored, and sessions slide forward while in use. SSO / SAML (Enterprise) is not built yet; `src/lib/services/auth.ts` is the place to add it.
+
+## Running in production
+
+- **Database: PostgreSQL.** `prisma/schema.prisma` stays on SQLite for zero-setup development; `prisma/postgres/schema.prisma` is the same model for PostgreSQL, generated by `npm run db:postgres:schema`, with migrations in `prisma/postgres/migrations`. Deploy with:
+  ```bash
+  npx prisma generate --schema prisma/postgres/schema.prisma
+  npx prisma migrate deploy --schema prisma/postgres/schema.prisma
+  ```
+  After a schema change: `npm run db:postgres:schema`, then `npx prisma migrate dev --schema prisma/postgres/schema.prisma --name <change>` against a development Postgres.
+- **Web servers and workers.** Syncs, analyses, the daily schedule and organization deletions run as jobs, never inside a web request. In production the web servers do not run jobs (`WORKER_MODE=separate` is the default); run one or more `npm run worker` processes next to them (`WORKER_CONCURRENCY` jobs each, default 2). Each organization runs one job at a time and organizations take turns, so one large customer cannot hold up the others. Failed jobs retry with backoff, and jobs left behind by a crashed worker are picked up again.
+- **Keys.** `ENCRYPTION_KEY` (32 bytes, hex or base64) is required. It wraps each organization's own data key, which encrypts that organization's cloud credentials. To rotate it, stop the web servers and workers, run `OLD_ENCRYPTION_KEY=<current> ENCRYPTION_KEY=<new> npm run keys:rotate` (safe to run again if it stops half way), then start everything with the new key. Deleting an organization destroys its data key.
+- **Email:** set `RESEND_API_KEY`, `EMAIL_FROM` and `APP_URL` (used in links).
+- **Payments:** set `STRIPE_SECRET_KEY`, `STRIPE_PRICE_PRO` and `STRIPE_WEBHOOK_SECRET`, and point a Stripe webhook at `/api/billing/webhook`. Without them the Billing page shows the plans but cannot charge.
+- **Demo:** leave `SEED_PASSWORD` empty so the seeded Acme users cannot sign in; the read-only demo visit still works.
+- **Backups:** the application keeps no database backups of its own; use your Postgres provider's point-in-time recovery. A customer's own export is on `/settings/data`.
 
 ## Production notes and limits
 
-- **Database:** switch `provider` in `prisma/schema.prisma` to `postgresql`.
-- **Sync:** runs inline in the request. Move `syncAccount()` to a queue or cron worker (e.g. nightly) for large estates.
+- **Plan limits:** cloud accounts, members (counting pending invitations), AI requests per month and manual syncs per day are hard limits. The resource allowance is soft: an estate over it is still analysed in full, and its accounts show an upgrade warning. Sample-data accounts never count.
+- **Remediation modes:** the settings (branch, branch + pull request, automatic apply, allowed change types, backup retention) are stored and shown throughout the product; pushing branches to the customer's Git provider is not wired up yet.
 - **Pricing:** the catalog is a curated snapshot of list prices. It does not include negotiated discounts, tiered egress breaks or every SKU. Swap in AWS Price List, Azure Retail Prices and the GCP Billing Catalog for live prices.
 - **Connectors:** the AWS, Azure and GCP connectors are written against the official APIs but have **not been exercised against live accounts** in this repo. Their data handling (batching, paging, alignment, unit conversion) is unit-tested with fake responses. The demo connector generates a realistic 90-day estate with six weeks of hourly usage.
 - **Usage history storage:** each series is stored as a JSON array on a `UsageSeries` row (about 1,000 samples for six hourly weeks). That is fine for thousands of resources. For very large estates, move the series to a time-series store or keep hourly data for fewer weeks.

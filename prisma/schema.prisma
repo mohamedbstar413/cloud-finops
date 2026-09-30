@@ -1,0 +1,208 @@
+// Cloud Price Optimizer — provider-agnostic data model.
+// SQLite is used for zero-setup local development; switch `provider` to
+// "postgresql" for production. JSON payloads are stored as strings so the
+// schema works on both engines.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id              String           @id @default(cuid())
+  name            String
+  plan            String           @default("pro")
+  createdAt       DateTime         @default(now())
+  members         Membership[]
+  accounts        CloudAccount[]
+  recommendations Recommendation[]
+  scenarios       Scenario[]
+  auditLogs       AuditLog[]
+  invites         Invite[]
+}
+
+model User {
+  id          String       @id @default(cuid())
+  name        String
+  email       String       @unique
+  createdAt   DateTime     @default(now())
+  memberships Membership[]
+}
+
+/// role: owner | admin | member | viewer
+model Membership {
+  id        String       @id @default(cuid())
+  userId    String
+  orgId     String
+  role      String       @default("member")
+  createdAt DateTime     @default(now())
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, orgId])
+}
+
+model Invite {
+  id        String       @id @default(cuid())
+  orgId     String
+  email     String
+  role      String       @default("member")
+  createdAt DateTime     @default(now())
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+/// provider: aws | azure | gcp
+/// status: connected | pending | error
+/// permissions: read_only | read_write
+model CloudAccount {
+  id          String       @id @default(cuid())
+  orgId       String
+  provider    String
+  name        String
+  externalId  String
+  region      String
+  status      String       @default("pending")
+  permissions String       @default("read_only")
+  authType    String
+  /// AES-256-GCM encrypted JSON credential blob (role ARN + external id, SP secret, SA key)
+  credentials String?
+  isDemo      Boolean      @default(false)
+  lastSyncAt  DateTime?
+  lastError   String?
+  createdAt   DateTime     @default(now())
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  resources   Resource[]
+  costs       CostRecord[]
+}
+
+/// Normalized resource inventory. `kind` is the provider-agnostic service kind
+/// (see src/lib/pricing/catalog.ts) — e.g. compute.vm, db.relational, storage.object.
+model Resource {
+  id          String       @id @default(cuid())
+  accountId   String
+  provider    String
+  externalId  String
+  name        String
+  kind        String
+  service     String
+  sku         String?
+  region      String
+  workload    String?
+  environment String?
+  state       String       @default("running")
+  quantity    Float        @default(1)
+  monthlyCost Float
+  /// JSON: utilization summary (cpuAvg, cpuP95, cpuMax, memP95, dutyCycle, requestsPerMonth…)
+  metrics     String       @default("{}")
+  /// JSON: configuration (instance family, storage class, access profile, data sources…)
+  config      String       @default("{}")
+  /// JSON: string[] of tags "key=value"
+  tags        String       @default("[]")
+  /// JSON: string[] of resource ids this resource sends traffic to
+  dependsOn   String       @default("[]")
+  createdAt   DateTime     @default(now())
+  account     CloudAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@index([workload])
+}
+
+/// Daily normalized cost line (FOCUS-style: provider, service, category, region).
+model CostRecord {
+  id        String       @id @default(cuid())
+  accountId String
+  date      DateTime
+  provider  String
+  service   String
+  category  String
+  region    String
+  workload  String?
+  cost      Float
+  account   CloudAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([date])
+  @@index([accountId, date])
+}
+
+/// category: architecture | cross_cloud | rightsizing | idle | commitment | storage | scheduling | anomaly
+/// status: open | in_progress | applied | dismissed | snoozed
+model Recommendation {
+  id                   String       @id @default(cuid())
+  orgId                String
+  fingerprint          String
+  accountId            String?
+  provider             String
+  targetProvider       String?
+  category             String
+  detector             String
+  title                String
+  summary              String
+  impact               String
+  currentMonthlyCost   Float
+  projectedMonthlyCost Float
+  monthlySavings       Float
+  savingsPct           Float
+  migrationCost        Float        @default(0)
+  effort               String
+  risk                 String
+  timeline             String
+  confidence           Float
+  status               String       @default("open")
+  snoozedUntil         DateTime?
+  dismissReason        String?
+  /// JSON string[]
+  resourceIds          String       @default("[]")
+  /// JSON RecommendationDetails (architecture graphs, comparison, steps, terraform, rollout)
+  details              String       @default("{}")
+  /// JSON AI enrichment payload (when OpenAI is configured)
+  ai                   String?
+  aiModel              String?
+  source               String       @default("engine")
+  overlapsWith         String?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  org                  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  tickets              Ticket[]
+
+  @@unique([orgId, fingerprint])
+}
+
+model Ticket {
+  id               String         @id @default(cuid())
+  recommendationId String
+  key              String
+  title            String
+  body             String
+  system           String         @default("internal")
+  url              String?
+  createdAt        DateTime       @default(now())
+  recommendation   Recommendation @relation(fields: [recommendationId], references: [id], onDelete: Cascade)
+}
+
+/// What-if simulations (prompt → plan → deterministic result → narrative)
+model Scenario {
+  id        String       @id @default(cuid())
+  orgId     String
+  prompt    String
+  plan      String
+  result    String
+  narrative String
+  aiModel   String?
+  createdBy String?
+  createdAt DateTime     @default(now())
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id        String       @id @default(cuid())
+  orgId     String
+  actor     String
+  action    String
+  target    String?
+  createdAt DateTime     @default(now())
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}

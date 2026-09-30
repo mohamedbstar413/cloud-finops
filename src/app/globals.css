@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-navy-950: #081129;
+  --color-navy-900: #0b1733;
+  --color-navy-800: #13224a;
+  --color-navy-700: #1c2e5c;
+  --color-navy-300: #9fb0d4;
+
+  --color-ink: #0f172a;
+  --color-muted: #64748b;
+  --color-line: #e6eaf1;
+  --color-canvas: #f6f8fb;
+
+  --color-brand: #2563eb;
+  --color-brand-600: #1d4ed8;
+  --color-brand-50: #eff4ff;
+
+  /* Chart series (validated for CVD separation): AWS / Azure / GCP */
+  --color-aws: #eb6834;
+  --color-azure: #2a78d6;
+  --color-gcp: #1baf7a;
+
+  --color-good: #16a34a;
+  --color-bad: #dc2626;
+}
+
+html,
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+}
+
+body {
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Recharts: recessive axes, no focus outline boxes */
+.recharts-wrapper:focus,
+.recharts-surface:focus {
+  outline: none;
+}
+.recharts-cartesian-axis-tick-value {
+  fill: #7a8699;
+  font-size: 11px;
+}
+
+pre code {
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+.animate-pulse-soft {
+  animation: pulse-soft 1.4s ease-in-out infinite;
+}

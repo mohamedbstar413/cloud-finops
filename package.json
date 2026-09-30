@@ -1,0 +1,57 @@
+{
+  "name": "cloud-price-optimizer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-cloud cost optimization platform with an AI Architecture Advisor",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "db:push": "prisma db push",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:reset": "prisma db push --force-reset && tsx prisma/seed.ts",
+    "setup": "prisma db push && tsx prisma/seed.ts",
+    "analyze": "tsx scripts/analyze.ts",
+    "postinstall": "prisma generate",
+    "test": "tsx --test tests/*.test.ts",
+    "test:stress": "FUZZ_RUNS=10 tsx --test tests/*.test.ts",
+    "fuzz:seed": "tsx scripts/fuzz-seed.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1143.0",
+    "@aws-sdk/client-cost-explorer": "^3.1143.0",
+    "@aws-sdk/client-ec2": "^3.1143.0",
+    "@aws-sdk/client-sts": "^3.1143.0",
+    "@azure/identity": "^4.13.1",
+    "@prisma/client": "^6.19.3",
+    "clsx": "^2.1.1",
+    "google-auth-library": "^10.9.1",
+    "lucide-react": "^1.49.0",
+    "next": "^16.3.7",
+    "openai": "^6.49.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "recharts": "^3.10.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^20.19.43",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "prisma": "^6.19.3",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "allowScripts": {
+    "prisma@6.19.3": true,
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "esbuild@0.28.2": true
+  }
+}

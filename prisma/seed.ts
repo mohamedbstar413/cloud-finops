@@ -41,11 +41,12 @@ async function main() {
       },
     });
     const stats = await persistSnapshot(account.id, spec.provider, demoSnapshot(spec.key, spec.externalId));
-    console.log(`  ${spec.provider.toUpperCase()} ${spec.name}: ${stats.resources} resources, ${stats.costRows} cost rows`);
+    console.log(`  ${spec.provider.toUpperCase()} ${spec.name}: ${stats.resources} resources, ${stats.costRows} cost rows, ${stats.series} usage series`);
   }
 
   const result = await runAnalysis(org.id);
   console.log(`Analysis: ${result.recommendations} recommendations (${result.architecture} architecture), $${Math.round(result.monthlySavings).toLocaleString()}/mo potential savings`);
+  console.log(`Usage history for ${result.coverage.withHistory} of ${result.coverage.measurable} measurable resources; ${result.heldBack} held back instead of guessed`);
 
   await prisma.auditLog.createMany({
     data: [

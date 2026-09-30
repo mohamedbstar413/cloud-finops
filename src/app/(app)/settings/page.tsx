@@ -3,6 +3,8 @@ import type { ReactNode } from "react";
 import { Card, CardHeader, PageHeader } from "@/components/ui";
 import { aiEnabled, aiModel } from "@/lib/ai/client";
 import { getSession } from "@/lib/auth";
+import { DAILY_DAYS, HOURLY_DAYS } from "@/lib/connectors/usage";
+import { FORECAST_DAYS, MIN_HISTORY_DAYS } from "@/lib/engine/signals";
 import { ENGINEER_WEEK_COST, PRICES, VM_TYPES } from "@/lib/pricing/catalog";
 import { usd } from "@/lib/format";
 
@@ -19,18 +21,18 @@ function Row({ ok, title, children }: { ok: boolean; title: string; children: Re
 }
 
 const DETECTORS = [
-  ["Serverless modernization", "Always-on VM fleets behind load balancers with bursty, short requests → API gateway + functions + queue"],
-  ["Cross-cloud arbitrage", "Portable workloads priced on every cloud incl. egress (data gravity), Spot buffer and migration cost"],
+  ["Serverless modernization", "Always-on VM fleets behind load balancers with bursty, short requests → API gateway + functions + queue, priced at today's and the forecast request volume"],
+  ["Cross-cloud arbitrage", "Portable workloads priced on every cloud incl. egress (data gravity), Spot buffer and migration cost; batch fleets are priced for the hours their job actually runs"],
   ["Static site → CDN", "Web servers serving static content → object storage + CDN"],
-  ["NAT → gateway endpoints", "Object-storage traffic through NAT → free gateway endpoints"],
-  ["Serverless databases", "Provisioned DBs with spiky load → capacity billed from the 24h load profile"],
-  ["PaaS → consumption containers", "Under-used App Service plans → Container Apps"],
-  ["Kubernetes bin-packing + Spot", "Over-requested node pools → packed on-demand pool + autoscaled Spot pool"],
-  ["Rightsizing (+Arm)", "p95 CPU/memory headroom, Graviton/Ampere where compatible"],
-  ["Idle & orphaned", "Idle VMs, unattached disks, unused IPs, stale snapshots"],
-  ["Storage tiering", "Access-pattern-aware lifecycle / Intelligent-Tiering, gp2 → gp3"],
-  ["Non-prod scheduling", "Office-hours schedules for staging/dev"],
-  ["Commitments", "Savings Plans / Reservations / CUDs sized on the post-optimization baseline"],
+  ["NAT → gateway endpoints", "The measured share of NAT traffic that goes to object storage → free gateway endpoints"],
+  ["Serverless databases", "Provisioned DBs with spiky load → capacity billed from the measured hour-of-week load curve"],
+  ["PaaS → consumption containers", "Under-used App Service plans → Container Apps, replicas sized from the hour-of-week load"],
+  ["Kubernetes bin-packing + Spot", "Over-requested node pools → on-demand pool sized for the peak + autoscaled Spot pool, replayed hour by hour"],
+  ["Rightsizing (+Arm)", "Busiest-day CPU and memory peaks projected 90 days ahead; held back when memory is not measured or usage is growing"],
+  ["Idle & orphaned", "VMs with no CPU and no network traffic, load balancers and NAT gateways that carry nothing, unattached disks, unused IPs, stale snapshots"],
+  ["Storage tiering", "Lifecycle / Intelligent-Tiering net of retrieval fees, gp2 → gp3 with the IOPS the volume actually uses"],
+  ["Non-prod scheduling", "Schedules derived from each fleet's own hour-of-week usage, with a one-hour buffer"],
+  ["Commitments", "Savings Plans / Reservations / CUDs sized on the post-optimization baseline and the hourly floor of autoscaled fleets"],
   ["Anomaly detection", "Weekday-seasonal robust z-score (MAD) on daily service spend"],
 ];
 
@@ -77,6 +79,24 @@ export default async function SettingsPage() {
           </dl>
         </Card>
       </div>
+
+      <Card className="mt-4">
+        <CardHeader title="Usage over time" subtitle="How utilisation and traffic history turns into a recommendation — or into a reason not to make one" />
+        <dl className="mt-3 grid gap-x-8 gap-y-2 px-5 pb-5 text-[13px] md:grid-cols-[220px_1fr]">
+          <dt className="text-muted">History collected per sync</dt>
+          <dd>
+            {HOURLY_DAYS} days hourly (CPU, memory, network, requests, IOPS, instance counts) · {DAILY_DAYS} days daily (storage, transfer)
+          </dd>
+          <dt className="text-muted">Peak a change is sized for</dt>
+          <dd>The busiest day&apos;s p95 of the hourly maximum, projected {FORECAST_DAYS} days ahead at the measured trend — a month-end peak counts, a single odd hour does not</dd>
+          <dt className="text-muted">Trend</dt>
+          <dd>Compared weekday with weekday and shrunk by its own uncertainty, so a weekly rhythm or day-to-day noise is not reported as growth</dd>
+          <dt className="text-muted">Weekly pattern</dt>
+          <dd>An hour of the week counts as idle only if it was quiet in every observed week; schedules keep a one-hour buffer</dd>
+          <dt className="text-muted">Minimum history</dt>
+          <dd>{MIN_HISTORY_DAYS} days before any usage-based change; with less, or with a metric missing, the resource is held back and the reason is shown on the Recommendations page</dd>
+        </dl>
+      </Card>
 
       <Card className="mt-4">
         <CardHeader title="Optimization detectors" subtitle="Run on every sync; results are reconciled by fingerprint so your decisions persist" />

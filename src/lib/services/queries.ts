@@ -1,5 +1,6 @@
 import { prisma, parseJson } from "../db";
-import type { Category, Level, RecommendationDetails } from "../engine/types";
+import { MEASURABLE_KINDS, type Coverage } from "../engine";
+import type { Category, DataGap, Level, RecommendationDetails } from "../engine/types";
 import type { Provider } from "../pricing/catalog";
 import { PROVIDERS } from "../pricing/catalog";
 
@@ -277,12 +278,41 @@ export async function getCostExplorer(orgId: string, f: CostFilters) {
   };
 }
 
+export interface HeldBackRow extends DataGap {
+  provider: Provider | null;
+  accountName: string | null;
+}
+
+/**
+ * What the last analysis could and could not evaluate: how many resources have
+ * usage history, and which ones the engine deliberately left alone (and why).
+ */
+export async function getDataCoverage(orgId: string) {
+  const run = await prisma.analysisRun.findFirst({ where: { orgId }, orderBy: { createdAt: "desc" } });
+  if (!run) return null;
+  const stored = parseJson<{ gaps?: DataGap[]; coverage?: Coverage }>(run.gaps, {});
+  const gaps = stored.gaps ?? [];
+  const resources = gaps.length
+    ? await prisma.resource.findMany({ where: { id: { in: gaps.map((g) => g.resourceId) } }, select: { id: true, provider: true, account: { select: { name: true } } } })
+    : [];
+  const byId = new Map(resources.map((r) => [r.id, r]));
+  return {
+    at: run.createdAt.toISOString(),
+    coverage: { measurable: run.evaluated, withHistory: run.withUsage, minDays: 0, maxDays: 0, unmeasured: 0, ...stored.coverage },
+    gaps: gaps.map<HeldBackRow>((g) => ({ ...g, provider: (byId.get(g.resourceId)?.provider as Provider | undefined) ?? null, accountName: byId.get(g.resourceId)?.account.name ?? null })),
+    heldBackCost: round(gaps.reduce((s, g) => s + g.monthlyCost, 0)),
+  };
+}
+
 export async function listAccounts(orgId: string) {
   const accounts = await prisma.cloudAccount.findMany({ where: { orgId }, orderBy: [{ provider: "asc" }, { createdAt: "asc" }] });
   const since = new Date(Date.now() - 30 * DAY);
-  const [counts, costs] = await Promise.all([
-    prisma.resource.groupBy({ by: ["accountId"], _count: { _all: true }, where: { accountId: { in: accounts.map((a) => a.id) } } }),
-    prisma.costRecord.groupBy({ by: ["accountId"], _sum: { cost: true }, where: { accountId: { in: accounts.map((a) => a.id) }, date: { gt: since } } }),
+  const ids = accounts.map((a) => a.id);
+  const [counts, costs, measurable, measured] = await Promise.all([
+    prisma.resource.groupBy({ by: ["accountId"], _count: { _all: true }, where: { accountId: { in: ids } } }),
+    prisma.costRecord.groupBy({ by: ["accountId"], _sum: { cost: true }, where: { accountId: { in: ids }, date: { gt: since } } }),
+    prisma.resource.groupBy({ by: ["accountId"], _count: { _all: true }, where: { accountId: { in: ids }, kind: { in: MEASURABLE_KINDS }, state: "running" } }),
+    prisma.resource.groupBy({ by: ["accountId"], _count: { _all: true }, where: { accountId: { in: ids }, kind: { in: MEASURABLE_KINDS }, state: "running", usage: { some: {} } } }),
   ]);
   return accounts.map((a) => ({
     id: a.id,
@@ -298,6 +328,9 @@ export async function listAccounts(orgId: string) {
     lastError: a.lastError,
     resources: counts.find((c) => c.accountId === a.id)?._count._all ?? 0,
     cost30d: round(costs.find((c) => c.accountId === a.id)?._sum.cost ?? 0),
+    // Usage history: how many of the resources that need it actually have it.
+    usage: { measurable: measurable.find((c) => c.accountId === a.id)?._count._all ?? 0, withHistory: measured.find((c) => c.accountId === a.id)?._count._all ?? 0 },
+    warnings: parseJson<string[]>(a.syncWarnings, []),
   }));
 }
 

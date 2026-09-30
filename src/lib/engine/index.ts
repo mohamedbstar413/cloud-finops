@@ -3,7 +3,7 @@ import { anomalyRecommendations } from "./anomaly";
 import { ARCHITECTURE_DETECTORS } from "./architecture";
 import { commitmentRecommendations } from "./commitments";
 import { STANDARD_DETECTORS } from "./standard";
-import type { Estate, RecommendationDraft } from "./types";
+import type { DataGap, Estate, RecommendationDraft, ResourceRow } from "./types";
 import { isFiniteDraft } from "./util";
 
 export * from "./types";
@@ -27,15 +27,63 @@ export function resolveOverlaps(drafts: RecommendationDraft[]): RecommendationDr
   return sorted;
 }
 
-export function runEngine(estate: Estate): RecommendationDraft[] {
+/** Resource kinds whose optimization depends on usage history. */
+export const MEASURABLE_KINDS = ["compute.vm", "db.instance", "db.vcore", "app.plan", "network.load_balancer", "network.nat_gateway", "storage.object"];
+const MEASURABLE = new Set(MEASURABLE_KINDS);
+
+/** Is there anything at all to judge this resource's usage by — history, or at least a summary figure? */
+const hasUsageData = (r: ResourceRow) =>
+  Boolean(r.usage && r.usage.days > 0) || r.kind === "storage.object" || r.metrics.cpuP95 !== undefined || r.metrics.requestsPerMonthM !== undefined || r.metrics.gbProcessed !== undefined;
+
+export interface Coverage {
+  /** Resources whose optimization depends on usage data. */
+  measurable: number;
+  /** …of which have usage history (not only summary metrics). */
+  withHistory: number;
+  /** Shortest and longest history among those, in days. */
+  minDays: number;
+  maxDays: number;
+  /** Resources with no utilisation or traffic data at all: they could not be evaluated, so nothing is said about them. */
+  unmeasured: number;
+}
+
+export interface EngineResult {
+  drafts: RecommendationDraft[];
+  /** Resources the engine deliberately did not optimize, and why. */
+  gaps: DataGap[];
+  coverage: Coverage;
+}
+
+export function runEngineWithCoverage(input: Estate): EngineResult {
+  const estate: Estate = { ...input, gaps: [] };
   const structural = [...ARCHITECTURE_DETECTORS, crossCloudArbitrage, ...STANDARD_DETECTORS].flatMap((detect) => detect(estate));
   const resolved = resolveOverlaps(structural.filter((d) => isFiniteDraft(d) && d.monthlySavings >= 10));
   const primary = resolved.filter((d) => !d.overlapsWith);
   const commitments = commitmentRecommendations(estate, primary);
   const anomalies = anomalyRecommendations(estate).filter(isFiniteDraft);
-  return [...resolved, ...commitments, ...anomalies]
-    .map((d) => ({ ...d, source: d.source ?? "engine" }))
-    .sort((a, b) => b.monthlySavings - a.monthlySavings);
+  const drafts = [...resolved, ...commitments, ...anomalies].map((d) => ({ ...d, source: d.source ?? "engine" })).sort((a, b) => b.monthlySavings - a.monthlySavings);
+
+  // A gap is moot when another recommendation already covers the resource.
+  const covered = new Set(primary.flatMap((d) => d.resourceIds));
+  const gaps = (estate.gaps ?? []).filter((g) => !covered.has(g.resourceId)).sort((a, b) => b.monthlyCost - a.monthlyCost);
+
+  const measurable = estate.resources.filter((r) => MEASURABLE.has(r.kind) && r.state === "running");
+  const histories = measurable.filter((r) => r.usage && r.usage.days > 0).map((r) => r.usage!.days);
+  return {
+    drafts,
+    gaps,
+    coverage: {
+      measurable: measurable.length,
+      withHistory: histories.length,
+      minDays: histories.length ? Math.round(Math.min(...histories)) : 0,
+      maxDays: histories.length ? Math.round(Math.max(...histories)) : 0,
+      unmeasured: measurable.filter((r) => !hasUsageData(r)).length,
+    },
+  };
+}
+
+export function runEngine(estate: Estate): RecommendationDraft[] {
+  return runEngineWithCoverage(estate).drafts;
 }
 
 type Summable = { monthlySavings: number; category: string; overlapsWith?: string | null; status?: string };

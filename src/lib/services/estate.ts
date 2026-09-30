@@ -1,15 +1,22 @@
 import { prisma, parseJson } from "../db";
 import type { Provider } from "../pricing/catalog";
 import type { AccountRow, DailyCost, Estate, ResourceRow } from "../engine/types";
+import { profileUsage, type Series } from "../usage/series";
 
 export async function loadEstate(orgId: string, days = 90): Promise<Estate> {
   const since = new Date(Date.now() - days * 86_400_000);
   const accounts = await prisma.cloudAccount.findMany({ where: { orgId, status: { not: "pending" } } });
   const ids = accounts.map((a) => a.id);
-  const [resources, costs] = await Promise.all([
+  const [resources, costs, usage] = await Promise.all([
     prisma.resource.findMany({ where: { accountId: { in: ids } } }),
     prisma.costRecord.findMany({ where: { accountId: { in: ids }, date: { gte: since } }, orderBy: { date: "asc" } }),
+    prisma.usageSeries.findMany({ where: { resource: { accountId: { in: ids } } } }),
   ]);
+  const seriesByResource = new Map<string, Series[]>();
+  for (const u of usage) {
+    const s: Series = { metric: u.metric, stat: u.stat as Series["stat"], unit: u.unit as Series["unit"], stepMinutes: u.stepMinutes, start: u.start.toISOString(), values: parseJson(u.values, []) };
+    seriesByResource.set(u.resourceId, [...(seriesByResource.get(u.resourceId) ?? []), s]);
+  }
 
   return {
     orgId,
@@ -39,6 +46,7 @@ export async function loadEstate(orgId: string, days = 90): Promise<Estate> {
       config: parseJson(r.config, {}),
       tags: parseJson(r.tags, []),
       dependsOn: parseJson(r.dependsOn, []),
+      usage: seriesByResource.has(r.id) ? profileUsage(seriesByResource.get(r.id)!) : undefined,
     })),
     daily: costs.map<DailyCost>((c) => ({
       date: c.date.toISOString().slice(0, 10),

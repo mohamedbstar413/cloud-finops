@@ -1,8 +1,63 @@
 /** Shared generators for complex-architecture tests and debugging scripts. */
-import type { Estate, ResourceRow } from "../src/lib/engine/types";
+import assert from "node:assert/strict";
+import { demoSnapshot } from "../src/lib/connectors/demo";
+import { DEMO_ACCOUNTS } from "../src/lib/demo/estate";
+import { totalPotentialSavings } from "../src/lib/engine";
+import type { ArchitectureSpec, Estate, RecommendationDraft, ResourceRow } from "../src/lib/engine/types";
 import type { WorkloadProfile } from "../src/lib/engine/custom";
 import { PROVIDERS, VM_TYPES, type Provider } from "../src/lib/pricing/catalog";
 import { priceComponent, type Component, type ComponentKind } from "../src/lib/pricing/components";
+import { profileUsage, type Series, type Stat, type Unit } from "../src/lib/usage/series";
+import { summarize } from "../src/lib/usage/summary";
+
+/** A fixed "now" so generated usage history is identical on every run. */
+export const FIXED_END = new Date("2026-09-28T00:00:00Z");
+
+/**
+ * The demo estate built in memory (no database), exactly as ingestion would
+ * load it: summary metrics plus the usage-history profile of every resource.
+ */
+export function demoEstate(end: Date = FIXED_END): Estate {
+  const accounts = DEMO_ACCOUNTS.map((a) => ({ id: a.key, provider: a.provider, name: a.name, externalId: a.externalId, region: a.region }));
+  const resources: ResourceRow[] = [];
+  const daily: Estate["daily"] = [];
+  for (const a of DEMO_ACCOUNTS) {
+    const snap = demoSnapshot(a.key, a.externalId, 90, end);
+    for (const { series, ...r } of snap.resources) {
+      resources.push({
+        ...r,
+        id: `${a.key}:${r.externalId}`,
+        accountId: a.key,
+        provider: a.provider,
+        sku: r.sku ?? null,
+        workload: r.workload ?? null,
+        environment: r.environment ?? null,
+        dependsOn: [],
+        usage: series?.length ? profileUsage(series) : undefined,
+      });
+    }
+    snap.costs.forEach((c) => daily.push({ ...c, accountId: a.key, provider: a.provider, workload: c.workload ?? null }));
+  }
+  return { orgId: "test", accounts, resources, daily };
+}
+
+/** Build a usage series from a function of (index, timestamp). `days` of samples ending at FIXED_END. */
+export function series(metric: string, days: number, fn: (i: number, ts: Date) => number | null, opts: { stat?: Stat; unit?: Unit; stepMinutes?: number; end?: Date } = {}): Series {
+  const stepMinutes = opts.stepMinutes ?? 60;
+  const n = Math.round((days * 1440) / stepMinutes);
+  const start = (opts.end ?? FIXED_END).getTime() - n * stepMinutes * 60_000;
+  return {
+    metric,
+    stat: opts.stat ?? "avg",
+    unit: opts.unit ?? "percent",
+    stepMinutes,
+    start: new Date(start).toISOString(),
+    values: Array.from({ length: n }, (_, i) => fn(i, new Date(start + i * stepMinutes * 60_000))),
+  };
+}
+
+/** Attach a usage-history profile to a resource built with `resource()`. */
+export const withUsage = (r: ResourceRow, ...s: Series[]): ResourceRow => ({ ...r, usage: profileUsage(s) });
 
 export function rng(seed: number) {
   let a = seed >>> 0;
@@ -152,6 +207,88 @@ export function randomEstate(seed: number): Estate {
   return { orgId: `fuzz-${seed}`, accounts, resources, daily };
 }
 
+const USAGE_SHAPES = ["flat", "business", "nightly", "growing", "shrinking", "spiky", "idle", "weekend"] as const;
+
+/**
+ * A random estate whose resources also carry random usage histories: different
+ * lengths (from 3 days to 2 months), shapes (flat, office hours, nightly batch,
+ * growing, shrinking, spiky, idle), missing metrics and collection gaps. About
+ * a quarter of the resources keep summary metrics only, as an account that was
+ * connected before history was collected would.
+ */
+export function randomUsageEstate(seed: number): Estate {
+  const estate = randomEstate(seed);
+  const r = rng(seed * 31 + 7);
+  const pick = <T,>(xs: readonly T[]) => xs[Math.floor(r() * xs.length)];
+  const resources = estate.resources.map((res) => {
+    if (r() < 0.25) return res;
+    const days = pick([3, 10, 14, 21, 35, 42, 60]);
+    const shape = pick(USAGE_SHAPES);
+    const level = shape === "idle" ? 0.3 + r() * 3 : 4 + r() * 80;
+    const growth = shape === "growing" ? 0.05 + r() * 0.4 : shape === "shrinking" ? -(0.05 + r() * 0.3) : 0;
+    const gappy = r() < 0.15;
+    const hours = days * 24;
+    const at = (scale: number, cap = Infinity) => (i: number, ts: Date): number | null => {
+      if (gappy && r() < 0.2) return null;
+      const h = ts.getUTCHours();
+      const weekend = (ts.getUTCDay() + 6) % 7 >= 5;
+      let v = level;
+      if (shape === "business") v *= !weekend && h >= 8 && h < 18 ? 1 : 0.04;
+      else if (shape === "nightly") v *= h < 6 ? 1 : 0.03;
+      else if (shape === "weekend") v *= weekend ? 1 : 0.05;
+      else if (shape === "spiky") v *= r() < 0.03 ? 4 : 0.5;
+      v *= Math.max(0.02, 1 - growth * ((hours - 1 - i) / 720));
+      v *= 0.9 + r() * 0.2;
+      return Math.min(cap, Math.max(0, v * scale));
+    };
+    const hourly = (metric: string, scale: number, opts: { stat?: Stat; unit?: Unit; cap?: number } = {}) => series(metric, days, at(scale, opts.cap), opts);
+    const daily = (metric: string, scale: number, opts: { stat?: Stat; unit?: Unit } = {}) => series(metric, Math.max(days, 30), at(scale), { ...opts, stepMinutes: 1440 });
+    const s: Series[] = [];
+    switch (res.kind) {
+      case "compute.vm":
+      case "db.instance":
+      case "db.vcore":
+      case "app.plan": {
+        s.push(hourly("cpu", 1, { cap: 100 }));
+        if (r() < 0.8) s.push(hourly("cpu_max", 1.1 + r() * 0.6, { stat: "max", cap: 100 }));
+        if (r() < 0.6) s.push(series("mem", days, () => 10 + level * (0.4 + r() * 0.1)));
+        if (res.kind === "compute.vm" && r() < 0.7) {
+          const bytes = r() < 0.5 ? 1e5 : 1e8 * (1 + r() * 50);
+          s.push(hourly("net_in", bytes / level, { stat: "sum", unit: "bytes" }), hourly("net_out", bytes / level, { stat: "sum", unit: "bytes" }));
+        }
+        if (res.kind === "compute.vm" && r() < 0.4) s.push(series("instances", days, (_, ts) => (ts.getUTCHours() < 8 ? Math.floor(res.quantity * 0.5) : res.quantity), { unit: "count" }));
+        if (res.kind === "app.plan" && r() < 0.5) s.push(hourly("requests", 1e3, { stat: "sum", unit: "count" }));
+        break;
+      }
+      case "network.load_balancer":
+        s.push(hourly("requests", shape === "idle" ? 0.5 : 5e3 * (1 + r() * 200), { stat: "sum", unit: "count" }));
+        break;
+      case "network.nat_gateway":
+        s.push(hourly("nat_bytes", shape === "idle" ? 1e5 : 1e9 * (0.1 + r() * 3), { stat: "sum", unit: "bytes" }));
+        if (r() < 0.6) {
+          const share = r();
+          s.push({ ...s[0], metric: "nat_storage_bytes", values: s[0].values.map((v) => (v === null ? null : v * share)) });
+        }
+        break;
+      case "storage.object":
+        s.push(daily("stored_gb", 50 + r() * 3000, { unit: "gb" }));
+        if (r() < 0.5) s.push(daily("read_gb", 1 + r() * 20, { stat: "sum", unit: "gb" }));
+        break;
+      case "storage.block":
+        if (r() < 0.5) s.push(hourly("iops", 5 + r() * 300, { unit: "iops" }));
+        break;
+      case "network.egress":
+        s.push(daily("egress_gb", 1 + r() * 30, { stat: "sum", unit: "gb" }));
+        break;
+    }
+    if (!s.length) return res;
+    const usage = profileUsage(s);
+    // Summary metrics are derived from the history, exactly as the connectors do.
+    return { ...res, usage, metrics: summarize(usage, res.metrics) };
+  });
+  return { ...estate, resources };
+}
+
 export const FUZZ_KINDS: ComponentKind[] = ["compute.vm", "compute.vm", "network.load_balancer", "storage.object", "storage.block", "db.instance", "db.vcore", "network.nat_gateway", "app.plan", "cache.managed", "network.egress", "network.cdn", "compute.function", "network.api_gateway"];
 
 
@@ -194,3 +331,48 @@ export function randomArchitecture(seed: number): { components: Component[]; pro
   return { components, profile };
 }
 
+/* ------------------------------------------------------------------------- */
+/* Invariants every engine run must hold                                      */
+/* ------------------------------------------------------------------------- */
+const finite = (n: unknown) => typeof n === "number" && Number.isFinite(n);
+
+export function assertSpecIntegrity(spec: ArchitectureSpec | undefined, where: string) {
+  if (!spec) return;
+  const ids = spec.nodes.map((n) => n.id);
+  assert.equal(new Set(ids).size, ids.length, `${where}: duplicate diagram node ids`);
+  for (const e of spec.edges) assert.ok(ids.includes(e.from) && ids.includes(e.to), `${where}: edge ${e.from}→${e.to} references a missing node`);
+  const sum = spec.components.reduce((s, c) => s + c.monthlyCost, 0);
+  assert.ok(Math.abs(sum - spec.monthlyCost) < 0.05 + spec.components.length * 0.01, `${where}: spec total ${spec.monthlyCost} ≠ Σ components ${sum}`);
+}
+
+export function assertEngineInvariants(estate: Estate, recs: RecommendationDraft[], label: string) {
+  const resourceIds = new Set(estate.resources.map((r) => r.id));
+  const fps = recs.map((r) => r.fingerprint);
+  assert.equal(new Set(fps).size, fps.length, `${label}: duplicate fingerprints`);
+  const primary = recs.filter((r) => !r.overlapsWith);
+  const primaryFps = new Set(primary.map((r) => r.fingerprint));
+  const claimed = new Set<string>();
+  for (const r of recs) {
+    const where = `${label} / ${r.title}`;
+    for (const k of ["currentMonthlyCost", "projectedMonthlyCost", "monthlySavings", "savingsPct", "migrationCost", "confidence"] as const) {
+      assert.ok(finite(r[k]), `${where}: ${k} is not finite (${r[k]})`);
+    }
+    assert.ok(r.monthlySavings >= 0 && r.monthlySavings <= r.currentMonthlyCost + 0.01, `${where}: savings ${r.monthlySavings} outside [0, ${r.currentMonthlyCost}]`);
+    assert.ok(r.projectedMonthlyCost >= 0, `${where}: negative projected cost`);
+    assert.ok(r.savingsPct >= 0 && r.savingsPct <= 100, `${where}: savingsPct ${r.savingsPct}`);
+    assert.ok(r.migrationCost >= 0, `${where}: negative migration cost`);
+    assert.ok(r.details.rollout.startWeek >= 0 && r.details.rollout.startWeek <= r.details.rollout.fullWeek, `${where}: invalid rollout`);
+    for (const id of r.resourceIds) assert.ok(resourceIds.has(id), `${where}: unknown resource ${id}`);
+    if (r.overlapsWith) assert.ok(primaryFps.has(r.overlapsWith), `${where}: overlapsWith points to a non-primary recommendation`);
+    assertSpecIntegrity(r.details.current, `${where} (current)`);
+    assertSpecIntegrity(r.details.proposed, `${where} (proposed)`);
+  }
+  for (const r of primary) {
+    for (const id of r.resourceIds) {
+      assert.ok(!claimed.has(id), `${label}: resource ${id} is claimed by two primary recommendations (double-counted savings)`);
+      claimed.add(id);
+    }
+  }
+  const spend = estate.resources.reduce((s, r) => s + r.monthlyCost, 0);
+  assert.ok(totalPotentialSavings(recs) <= spend + 0.01, `${label}: potential savings exceed total spend`);
+}

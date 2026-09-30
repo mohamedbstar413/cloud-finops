@@ -36,8 +36,8 @@ export function AccountRowActions({ account, canManage, canSync }: { account: { 
         disabled={!canSync || busy !== null}
         onClick={() =>
           run("sync", async () => {
-            const r = await api<{ resources: number; costRows: number; analysis: { recommendations: number } | null }>(`/api/accounts/${account.id}/sync`, { method: "POST" });
-            return `Synced ${r.resources} resources and ${r.costRows} cost rows · ${r.analysis?.recommendations ?? 0} recommendations`;
+            const r = await api<{ resources: number; costRows: number; series: number; warnings: string[]; analysis: { recommendations: number } | null }>(`/api/accounts/${account.id}/sync`, { method: "POST" });
+            return `Synced ${r.resources} resources, ${r.series} usage series and ${r.costRows} cost rows · ${r.analysis?.recommendations ?? 0} recommendations${r.warnings.length ? ` · ${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""} (see below)` : ""}`;
           })
         }
         title="Sync now"

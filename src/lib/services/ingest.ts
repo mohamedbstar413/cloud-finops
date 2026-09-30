@@ -47,6 +47,25 @@ export async function persistSnapshot(accountId: string, provider: string, snap:
   const gone = existing.filter((r) => !keep.has(r.id)).map((r) => r.id);
   if (gone.length) await prisma.resource.deleteMany({ where: { id: { in: gone } } });
 
+  // Usage history: replace each resource's series with the freshly collected window.
+  const refreshed = await prisma.resource.findMany({ where: { accountId }, select: { id: true, externalId: true } });
+  const idByExt = new Map(refreshed.map((r) => [r.externalId, r.id]));
+  await prisma.usageSeries.deleteMany({ where: { resourceId: { in: refreshed.map((r) => r.id) } } });
+  const seriesRows = snap.resources.flatMap((r) =>
+    (r.series ?? [])
+      .filter((s) => s.values.length)
+      .map((s) => ({
+        resourceId: idByExt.get(r.externalId)!,
+        metric: s.metric,
+        stat: s.stat,
+        unit: s.unit,
+        stepMinutes: s.stepMinutes,
+        start: new Date(s.start),
+        values: JSON.stringify(s.values),
+      })),
+  );
+  for (let i = 0; i < seriesRows.length; i += 50) await prisma.usageSeries.createMany({ data: seriesRows.slice(i, i + 50) });
+
   await prisma.costRecord.deleteMany({ where: { accountId } });
   const rows = snap.costs.map((c) => ({
     accountId,
@@ -61,7 +80,7 @@ export async function persistSnapshot(accountId: string, provider: string, snap:
   for (let i = 0; i < rows.length; i += 2000) {
     await prisma.costRecord.createMany({ data: rows.slice(i, i + 2000) });
   }
-  return { resources: snap.resources.length, costRows: rows.length };
+  return { resources: snap.resources.length, costRows: rows.length, series: seriesRows.length };
 }
 
 export async function collectSnapshot(account: { provider: string; isDemo: boolean; externalId: string; credentials: string | null }): Promise<Snapshot> {
@@ -102,9 +121,12 @@ export async function syncAccount(accountId: string, { analyze = true } = {}) {
   try {
     const snap = await collectSnapshot(account);
     const stats = await persistSnapshot(account.id, account.provider, snap);
-    await prisma.cloudAccount.update({ where: { id: accountId }, data: { status: "connected", lastSyncAt: new Date(), lastError: null } });
+    await prisma.cloudAccount.update({
+      where: { id: accountId },
+      data: { status: "connected", lastSyncAt: new Date(), lastError: null, syncWarnings: JSON.stringify([...new Set(snap.warnings ?? [])].slice(0, 20)) },
+    });
     const analysis = analyze ? await runAnalysis(account.orgId) : null;
-    return { ok: true as const, ...stats, analysis };
+    return { ok: true as const, ...stats, warnings: snap.warnings ?? [], analysis };
   } catch (e) {
     await prisma.cloudAccount.update({ where: { id: accountId }, data: { status: "error", lastError: (e as Error).message.slice(0, 500) } });
     return { ok: false as const, error: (e as Error).message };

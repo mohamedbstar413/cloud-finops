@@ -10,6 +10,7 @@ import { api, CodeBlock, inputClass, Modal, Notice, Spinner, Tabs } from "@/comp
 import { CostBreakdown } from "@/components/CostBreakdown";
 import { ProjectionPanel } from "@/components/ProjectionPanel";
 import { ProviderLogo } from "@/components/ProviderLogo";
+import { UsageEvidencePanel } from "@/components/UsageEvidence";
 import { buttonClass, Card, CardHeader, CategoryBadge, ImpactBadge, LevelText, Pill, StatusBadge } from "@/components/ui";
 import type { ArchitectureSpec } from "@/lib/engine/types";
 import { PROVIDER_NAME, usd } from "@/lib/format";
@@ -311,6 +312,8 @@ function Overview({ data }: { data: Data }) {
           </div>
         ))}
       </Card>
+
+      {details.usage && <UsageEvidencePanel usage={details.usage} />}
 
       <Card>
         <button onClick={() => setOpen((o) => !o)} className="flex w-full items-center justify-between px-5 py-3.5 text-left">

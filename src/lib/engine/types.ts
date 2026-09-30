@@ -1,5 +1,6 @@
 import type { Provider } from "../pricing/catalog";
 import type { IconKey, PricedComponent } from "../pricing/components";
+import type { UsageProfile } from "../usage/series";
 
 export type Category =
   | "architecture"
@@ -84,6 +85,22 @@ export interface ResourceRow {
   config: ResourceConfig;
   tags: string[];
   dependsOn: string[];
+  /** Usage history profile (trend, weekly pattern, peaks). Absent when only summary metrics exist. */
+  usage?: UsageProfile;
+}
+
+/** Why the engine held back on a resource instead of guessing. */
+export interface DataGap {
+  resourceId: string;
+  resource: string;
+  detector: string;
+  /** missing_metric | short_history | growing | in_use | over_limit */
+  kind: "missing_metric" | "short_history" | "growing" | "in_use";
+  reason: string;
+  /** What the customer can do to unlock the evaluation. */
+  fix?: string;
+  /** Monthly cost of the resource that could not be evaluated. */
+  monthlyCost: number;
 }
 
 export interface AccountRow {
@@ -110,6 +127,33 @@ export interface Estate {
   accounts: AccountRow[];
   resources: ResourceRow[];
   daily: DailyCost[];
+  /** Filled by detectors while they run (see runEngineWithCoverage). */
+  gaps?: DataGap[];
+}
+
+/** A usage chart shown as evidence on a recommendation. */
+export interface UsageChart {
+  id: string;
+  title: string;
+  unit: "percent" | "count" | "gb" | "bytes" | "ms" | "iops";
+  /** Daily points: p95 (or daily total for additive metrics). */
+  points: { d: string; v: number }[];
+  /** Horizontal reference lines, e.g. the projected peak after the change. */
+  lines?: { label: string; value: number; tone: "limit" | "projected" | "baseline" }[];
+  trendPerMonth?: number;
+  note?: string;
+}
+
+export interface UsageEvidence {
+  /** Days of history the recommendation is based on. */
+  days: number;
+  /** Metrics that were available (e.g. CPU, memory, network). */
+  metrics: string[];
+  /** Metrics that were not available and what was assumed instead. */
+  missing?: string[];
+  charts: UsageChart[];
+  /** Hour-of-week values (168, Monday 00:00 UTC first): utilisation in percent unless `unit` says otherwise, with the hours judged idle. */
+  heatmap?: { title: string; values: number[]; unit?: string; idle?: boolean[]; schedule?: string };
 }
 
 export interface DiagramNode {
@@ -179,6 +223,8 @@ export interface RecommendationDetails {
   rollout: { startWeek: number; fullWeek: number };
   fitScore?: number;
   assumptions?: string[];
+  /** Usage history behind the recommendation. */
+  usage?: UsageEvidence;
 }
 
 export interface RecommendationDraft {

@@ -23,6 +23,7 @@ model Organization {
   scenarios       Scenario[]
   auditLogs       AuditLog[]
   invites         Invite[]
+  analysisRuns    AnalysisRun[]
 }
 
 model User {
@@ -73,6 +74,8 @@ model CloudAccount {
   isDemo      Boolean      @default(false)
   lastSyncAt  DateTime?
   lastError   String?
+  /// JSON string[]: data the last sync could not collect (e.g. a metric namespace it may not read)
+  syncWarnings String      @default("[]")
   createdAt   DateTime     @default(now())
   org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
   resources   Resource[]
@@ -106,9 +109,30 @@ model Resource {
   dependsOn   String       @default("[]")
   createdAt   DateTime     @default(now())
   account     CloudAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  usage       UsageSeries[]
 
   @@index([accountId])
   @@index([workload])
+}
+
+/// Usage history of a resource, stored columnar: one row per metric and
+/// resolution; `values` is a JSON number[] (null = missing sample) starting at
+/// `start`, one sample every `stepMinutes`.
+model UsageSeries {
+  id          String   @id @default(cuid())
+  resourceId  String
+  /// cpu | cpu_max | mem | net_in | net_out | requests | latency_p95 | instances | iops | nat_bytes | nat_storage_bytes | stored_gb | read_gb | egress_gb | scanned_gb | connections
+  metric      String
+  /// avg | max | sum
+  stat        String
+  /// percent | bytes | count | ms | gb | iops
+  unit        String
+  stepMinutes Int
+  start       DateTime
+  values      String
+  resource    Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@unique([resourceId, metric])
 }
 
 /// Daily normalized cost line (FOCUS-style: provider, service, category, region).
@@ -205,4 +229,18 @@ model AuditLog {
   target    String?
   createdAt DateTime     @default(now())
   org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+/// One run of the optimization engine: what it evaluated and what it held back (data gaps).
+model AnalysisRun {
+  id              String       @id @default(cuid())
+  orgId           String
+  createdAt       DateTime     @default(now())
+  recommendations Int
+  monthlySavings  Float
+  evaluated       Int
+  withUsage       Int
+  /// JSON DataGap[]
+  gaps            String       @default("[]")
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 }

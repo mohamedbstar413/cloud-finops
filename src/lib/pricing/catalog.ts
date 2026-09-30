@@ -327,6 +327,14 @@ export const PRICES = {
     azure: { premium: 0.132, standard: 0.075, name: "Managed Disks" },
     gcp: { premium: 0.17, standard: 0.1, name: "Persistent Disk" },
   },
+  /** Retrieval fee per GB read back from cool / cold tiers. */
+  objectRetrievalPerGb: {
+    aws: { cool: 0.01, cold: 0.03 },
+    azure: { cool: 0.01, cold: 0.03 },
+    gcp: { cool: 0.01, cold: 0.02 },
+  } as Record<Provider, { cool: number; cold: number }>,
+  /** gp3 extras above the included 3,000 IOPS baseline. */
+  gp3: { baselineIops: 3000, perIopsMonth: 0.005 },
   snapshot: { aws: 0.05, azure: 0.05, gcp: 0.026 } as Record<Provider, number>,
   snapshotArchive: { aws: 0.0125, azure: 0.0125, gcp: 0.0026 } as Record<Provider, number>,
   publicIp: { aws: 3.65, azure: 2.63, gcp: 3.65 } as Record<Provider, number>,

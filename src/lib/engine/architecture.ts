@@ -1,5 +1,6 @@
 import { HOURS_PER_MONTH, PRICES, resolveVm } from "../pricing/catalog";
-import { Component, serviceName } from "../pricing/components";
+import { Component, priceComponents, serviceName } from "../pricing/components";
+import { chartOf, cpuSignal, enoughHistory, evidence, MEMORY_AGENT_FIX, memSignal, MIN_HISTORY_DAYS, pctTrend, recordGap, requestSignal } from "./signals";
 import {
   tfAksSpot,
   tfAuroraServerless,
@@ -9,7 +10,7 @@ import {
   tfStaticSite,
   tfVpcEndpoints,
 } from "./terraform";
-import type { DiagramEdge, DiagramNode, Detector, RecommendationDraft, ResourceRow } from "./types";
+import type { DiagramEdge, DiagramNode, Detector, Estate, RecommendationDraft, ResourceRow } from "./types";
 import {
   buildArchitecture,
   countOf,
@@ -20,6 +21,7 @@ import {
   pct,
   round,
   specFromResources,
+  sumCost,
   weightedAvg,
 } from "./util";
 
@@ -53,12 +55,13 @@ const carriedNodes = (rs: ResourceRow[], layer: number): DiagramNode[] =>
 
 /**
  * Billed capacity for autoscaling/serverless services, derived from the observed
- * 24h utilisation profile (not from provisioned capacity).
+ * utilisation profile — hour-of-week (168 values) when history exists, else a
+ * 24h profile, else the flat average — not from provisioned capacity.
  */
-export function billedCapacity(maxUnits: number, hourly: number[] | undefined, avgPct: number, minUnits: number, headroom = 1.25) {
-  const profile = hourly && hourly.length === 24 ? hourly : Array(24).fill(avgPct);
+export function billedCapacity(maxUnits: number, profileHours: number[] | undefined, avgPct: number, minUnits: number, headroom = 1.25) {
+  const profile = profileHours && profileHours.length >= 24 ? profileHours : Array(24).fill(avgPct);
   const perHour = profile.map((h) => Math.max(minUnits, Math.min(maxUnits, (maxUnits * h * headroom) / 100)));
-  return perHour.reduce((a, b) => a + b, 0) / 24;
+  return perHour.reduce((a, b) => a + b, 0) / perHour.length;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -72,14 +75,15 @@ export const serverlessModernizationWith = ({ minFit = 60 } = {}): Detector => (
     if (!lb || countOf(vms) < 3) continue;
     if (vms.some((v) => v.config.staticContent || v.config.role === "k8s-node")) continue;
     if (!vms.every((v) => v.config.stateless)) continue;
-    const reqM = lb.metrics.requestsPerMonthM;
-    if (!reqM) continue;
+    const traffic = requestSignal(lb);
+    if (!traffic || traffic.monthlyM <= 0) continue;
+    const reqM = round(traffic.monthlyM, 1);
 
     const provider = vms[0].provider;
     const dur = lb.metrics.avgDurationMs ?? 150;
     const duty = weightedAvg(vms, (v) => v.metrics.dutyCycle);
     const cpuAvg = weightedAvg(vms, (v) => v.metrics.cpuAvg);
-    const peak = lb.metrics.peakToAvg ?? 1;
+    const peak = traffic.peakToAvg;
     const asyncShare = vms[0].config.asyncShare ?? 0.25;
     const memoryMb = vms[0].config.memoryMb ?? 1024;
 
@@ -89,6 +93,10 @@ export const serverlessModernizationWith = ({ minFit = 60 } = {}): Detector => (
     fit += peak >= 4 ? 20 : peak >= 2 ? 12 : 0;
     fit += dur <= 1000 ? 20 : dur <= 5000 ? 10 : 0;
     if (fit < minFit) continue;
+    if (!enoughHistory(traffic)) {
+      recordGap(estate, lb, "arch.serverless", "short_history", `Only ${Math.round(traffic.days)} days of request history; ${MIN_HISTORY_DAYS} are needed to price a per-request architecture.`);
+      continue;
+    }
 
     const replacedIds = new Set([...vms.map((v) => v.id), lb.id]);
     for (const r of rs) if (r.kind === "storage.block") replacedIds.add(r.id);
@@ -115,13 +123,14 @@ export const serverlessModernizationWith = ({ minFit = 60 } = {}): Detector => (
       ...carriedNodes(keep, 3).map((n) => ({ from: "vm", to: n.id })),
     ];
 
-    const proposedComponents: Component[] = [
-      { id: "api", kind: "network.api_gateway", provider, label: `${api} (HTTP)`, region, usage: { requestsM: reqM, tier: "http" } },
-      { id: "fn-api", kind: "compute.function", provider, label: `${fn} — API handlers`, region, usage: { requestsM: round(reqM * (1 - asyncShare)), avgDurationMs: dur, memoryMb } },
-      { id: "queue", kind: "messaging.queue", provider, label: `${q} — async jobs`, region, usage: { requestsM: round(reqM * asyncShare * 3) } },
-      { id: "fn-worker", kind: "compute.function", provider, label: `${fn} — queue workers`, region, usage: { requestsM: round((reqM * asyncShare) / 10), avgDurationMs: Math.min(dur * 6, 60000), memoryMb: 1024 } },
-      ...carried(keep),
+    // Per-request stack as a function of traffic, so it can be priced today AND at the forecast volume.
+    const stack = (m: number): Component[] => [
+      { id: "api", kind: "network.api_gateway", provider, label: `${api} (HTTP)`, region, usage: { requestsM: m, tier: "http" } },
+      { id: "fn-api", kind: "compute.function", provider, label: `${fn} — API handlers`, region, usage: { requestsM: round(m * (1 - asyncShare)), avgDurationMs: dur, memoryMb } },
+      { id: "queue", kind: "messaging.queue", provider, label: `${q} — async jobs`, region, usage: { requestsM: round(m * asyncShare * 3) } },
+      { id: "fn-worker", kind: "compute.function", provider, label: `${fn} — queue workers`, region, usage: { requestsM: round((m * asyncShare) / 10), avgDurationMs: Math.min(dur * 6, 60000), memoryMb: 1024 } },
     ];
+    const proposedComponents: Component[] = [...stack(reqM), ...carried(keep)];
     const proposedNodes: DiagramNode[] = [
       { id: "users", label: "Users", icon: "users", layer: 0 },
       { id: "api", label: api, icon: "api", layer: 1, provider, highlight: "added" },
@@ -151,7 +160,28 @@ export const serverlessModernizationWith = ({ minFit = 60 } = {}): Detector => (
       "No load balancer or servers to manage",
     ]);
 
+    // Serverless cost scales with traffic while the fleet's cost is fixed: check it still wins at the forecast volume.
+    const carriedCost = sumCost(keep);
+    const perMillion = (proposed.monthlyCost - carriedCost) / reqM;
+    const breakEvenM = perMillion > 0 ? (current.monthlyCost - carriedCost) / perMillion : Infinity;
+    const forecastM = round(traffic.forecastM, 1);
+    const forecastCost = priceComponents(stack(forecastM)).total + carriedCost;
+    const growth = Math.max(-0.2, Math.min(0.25, traffic.trendPerMonth));
+    const monthsToBreakEven = growth > 0.002 && breakEvenM > reqM ? Math.log(breakEvenM / reqM) / Math.log(1 + growth) : Infinity;
+    if (proposed.monthlyCost >= current.monthlyCost * 0.9) continue; // not materially cheaper even at today's traffic
+    if (forecastCost >= current.monthlyCost * 0.9) {
+      recordGap(
+        estate,
+        lb,
+        "arch.serverless",
+        "growing",
+        `Per-request pricing is cheaper today (${money(proposed.monthlyCost)} vs ${money(current.monthlyCost)}), but traffic is growing ${pctTrend(traffic.trendPerMonth)}: at about ${Math.round(forecastM)}M requests/month in 6 months it would cost ${money(forecastCost)} — no longer a saving.`,
+      );
+      continue;
+    }
+
     const weeks = 8;
+    const fleetUsage = vms[0].usage?.metrics;
     out.push(
       makeDraft({
         fingerprint: `arch.serverless:${key}`,
@@ -173,17 +203,23 @@ export const serverlessModernizationWith = ({ minFit = 60 } = {}): Detector => (
           fitScore: fit,
           explanation:
             `Your ${workload} service uses ${vmCount} always-on ${serviceName("compute.vm", provider)} instances behind a load balancer. ` +
-            `Traffic averages ${round(reqM)}M requests/month with a ${dur} ms median duration, but CPU averages only ${pct(cpuAvg)} and the fleet is busy ${pct(duty * 100)} of hours. ` +
-            `You are paying for peak capacity 24/7. Moving the request path to ${api} + ${fn} and background work to ${q} bills per request, scales to zero overnight and removes host management.`,
+            `Traffic is ${Math.round(reqM)}M requests/month with a ${dur} ms average duration, but CPU averages only ${pct(cpuAvg)} and the fleet is busy ${pct(duty * 100)} of hours. ` +
+            `You are paying for peak capacity 24/7. Moving the request path to ${api} + ${fn} and background work to ${q} bills per request, scales to zero overnight and removes host management. ` +
+            (traffic.source === "history"
+              ? `Traffic is trending ${pctTrend(traffic.trendPerMonth)}: at about ${Math.round(forecastM)}M requests/month in 6 months the new architecture costs ${money(forecastCost)}, still below today's ${money(current.monthlyCost)}. ` +
+                `It stays cheaper up to about ${Math.round(breakEvenM).toLocaleString()}M requests/month${Number.isFinite(monthsToBreakEven) ? ` (roughly ${Math.round(monthsToBreakEven)} months away at this growth)` : ""}.`
+              : `Only a monthly request total is available (no history), so the traffic trend is unknown; it stays cheaper up to about ${Math.round(breakEvenM).toLocaleString()}M requests/month.`),
           evidence: [
             { label: "Average CPU", value: pct(cpuAvg) },
-            { label: "Duty cycle", value: pct(duty * 100) },
+            { label: "Busy hours", value: pct(duty * 100) },
             { label: "Peak-to-average traffic", value: `${peak.toFixed(1)}×` },
-            { label: "Requests / month", value: `${round(reqM)}M` },
-            { label: "Median request duration", value: `${dur} ms` },
+            { label: "Requests / month", value: `${Math.round(reqM)}M${traffic.source === "history" ? ` (${pctTrend(traffic.trendPerMonth)})` : ""}` },
+            ...(traffic.source === "history" ? [{ label: "Requests in 6 months", value: `${Math.round(forecastM)}M → ${money(forecastCost)}/mo` }] : []),
+            { label: "Break-even volume", value: `${Math.round(breakEvenM).toLocaleString()}M requests/month` },
+            { label: "Average request duration", value: `${dur} ms` },
             { label: "Serverless fit score", value: `${fit}/100` },
           ],
-          benefits: ["65%+ lower compute cost at current traffic", "Scales per request — no over-provisioning for peaks", "No servers, AMIs or OS patching", "Pay only for actual usage; idle nights cost ~$0"],
+          benefits: [`${pct(((current.monthlyCost - proposed.monthlyCost) / current.monthlyCost) * 100)} lower cost at current traffic`, "Scales per request — no over-provisioning for peaks", "No servers, AMIs or OS patching", "Pay only for actual usage; idle nights cost ~$0"],
           risks: [
             "Cold starts add ~100–300 ms to p99 latency (mitigate with provisioned concurrency on hot paths)",
             `${api} caps synchronous requests at 29 s — long calls must move to the queue`,
@@ -207,7 +243,11 @@ export const serverlessModernizationWith = ({ minFit = 60 } = {}): Detector => (
           ],
           terraform: provider === "aws" ? tfServerless({ name: workload, region, memoryMb, asyncShare }) : undefined,
           rollout: { startWeek: 2, fullWeek: 4 },
-          assumptions: [`${round(reqM)}M requests/month at ${dur} ms, ${memoryMb} MB`, `${pct(asyncShare * 100)} of requests trigger async work`, "Egress, logging and data stores unchanged"],
+          assumptions: [`${Math.round(reqM)}M requests/month at ${dur} ms, ${memoryMb} MB`, `${pct(asyncShare * 100)} of requests trigger async work`, "Egress, logging and data stores unchanged"],
+          usage: evidence(traffic.days, ["requests", "CPU"], [
+            chartOf(traffic.profile, "requests", "Requests per day", { note: `Break-even at ${Math.round(breakEvenM).toLocaleString()}M requests/month` }),
+            chartOf(fleetUsage?.cpu, "cpu", `Fleet CPU — daily p95 (${vms[0].name})`),
+          ]),
         },
       }),
     );
@@ -229,8 +269,12 @@ export const staticSiteToCdn: Detector = (estate) => {
     const block = rs.filter((r) => r.kind === "storage.block");
     const replaced = [...vms, ...(lb ? [lb] : []), ...egress, ...block];
     const gbOut = egress.reduce((s, e) => s + (e.metrics.gbEgress ?? 0), 0);
+    const requestsMeasured = lb?.metrics.requestsPerMonthM !== undefined;
     const reqM = lb?.metrics.requestsPerMonthM ?? 20;
+    const sizeKnown = vms[0].config.sizeGb !== undefined;
     const siteGb = vms[0].config.sizeGb ?? 25;
+    const delivery = egress[0]?.usage?.metrics.egress_gb;
+    const hits = lb?.usage?.metrics.requests;
     const region = vms[0].region;
     const cdn = serviceName("network.cdn", provider);
     const obj = serviceName("storage.object", provider);
@@ -278,8 +322,9 @@ export const staticSiteToCdn: Detector = (estate) => {
           explanation: `The ${vms[0].workload} workload serves pre-rendered static files from ${countOf(vms)} always-on ${vms[0].sku} instances. Static sites don't need compute: hosting them in ${obj} behind ${cdn} costs a fraction, has no servers to patch and serves visitors from edge locations.`,
           evidence: [
             { label: "Content type", value: "Static (HTML/CSS/JS/images)" },
-            { label: "Site size", value: `${siteGb} GB` },
-            { label: "Monthly delivery", value: `${round(gbOut / 1024, 1)} TB` },
+            { label: "Site size", value: sizeKnown ? `${siteGb} GB` : `not measured (${siteGb} GB assumed)` },
+            { label: "Monthly delivery", value: `${round(gbOut / 1024, 1)} TB${delivery ? ` (${pctTrend(delivery.trendPerMonth)})` : ""}` },
+            { label: "Requests / month", value: requestsMeasured ? `${Math.round(reqM)}M${hits ? ` (${pctTrend(hits.trendPerMonth)})` : ""}` : `not measured (${reqM}M assumed)` },
             { label: "Average CPU", value: pct(weightedAvg(vms, (v) => v.metrics.cpuAvg)) },
           ],
           benefits: ["No servers to run or patch", "Lower latency via edge caching", "Built-in DDoS protection at the edge"],
@@ -297,6 +342,12 @@ export const staticSiteToCdn: Detector = (estate) => {
           ],
           terraform: provider === "aws" ? tfStaticSite({ name: vms[0].workload!, region }) : undefined,
           rollout: { startWeek: 1, fullWeek: 2 },
+          assumptions: [
+            "CDN and origin priced at the delivery volume of the last 30 days; both scale with traffic, as the current egress does",
+            ...(requestsMeasured ? [] : [`Request volume is not measured: ${reqM}M requests/month assumed`]),
+            ...(sizeKnown ? [] : [`Site size is not measured: ${siteGb} GB assumed`]),
+          ],
+          usage: evidence(delivery?.days ?? hits?.days ?? 0, [...(delivery ? ["data delivered"] : []), ...(hits ? ["requests"] : [])], [chartOf(delivery, "egress", "Data delivered — GB per day"), chartOf(hits, "requests", "Requests per day")]),
         },
       }),
     );
@@ -307,13 +358,30 @@ export const staticSiteToCdn: Detector = (estate) => {
 /* ------------------------------------------------------------------------- */
 /* 3. NAT gateway carrying object-storage traffic → gateway endpoints         */
 /* ------------------------------------------------------------------------- */
+/** NAT volume (GB/month) and the share of it that goes to object storage, from measured bytes when available. */
+function natTraffic(estate: Estate, nat: ResourceRow): { gb: number; share: number; measured: boolean } | null {
+  const m = nat.usage?.metrics;
+  const gb = m?.nat_bytes ? m.nat_bytes.monthlyTotal / 1e9 : (nat.metrics.gbProcessed ?? 0);
+  if (gb <= 1000) return null;
+  const measuredShare = m?.nat_bytes && m.nat_storage_bytes && m.nat_bytes.monthlyTotal > 0 ? m.nat_storage_bytes.monthlyTotal / m.nat_bytes.monthlyTotal : undefined;
+  const share = measuredShare ?? nat.config.s3TrafficShare;
+  if (share === undefined) {
+    recordGap(estate, nat, "arch.nat_endpoints", "missing_metric", `${round(gb / 1024)} TB/month flows through this NAT gateway, but there is no breakdown by destination, so the share going to object storage is unknown.`, "Enable VPC Flow Logs to see where NAT traffic goes");
+    return null;
+  }
+  return share >= 0.3 ? { gb, share, measured: measuredShare !== undefined } : null;
+}
+
 export const natToEndpoints: Detector = (estate) =>
   estate.resources
-    .filter((r) => r.kind === "network.nat_gateway" && (r.config.s3TrafficShare ?? 0) >= 0.3 && (r.metrics.gbProcessed ?? 0) > 1000)
-    .map((nat) => {
+    .filter((r) => r.kind === "network.nat_gateway")
+    .map((nat) => ({ nat, t: natTraffic(estate, nat) }))
+    .filter((x) => x.t !== null)
+    .map(({ nat, t }) => {
       const p = nat.provider;
-      const gb = nat.metrics.gbProcessed!;
-      const share = nat.config.s3TrafficShare!;
+      const gb = t!.gb;
+      const share = t!.share;
+      const natBytes = nat.usage?.metrics.nat_bytes;
       const endpointName = p === "aws" ? "VPC Gateway Endpoints" : p === "azure" ? "Service Endpoints" : "Private Google Access";
       const objName = serviceName("storage.object", p);
       const current = specFromResources("Current architecture", p, [nat],
@@ -355,13 +423,15 @@ export const natToEndpoints: Detector = (estate) =>
         effort: "low",
         risk: "low",
         timeline: "1–3 days",
-        confidence: 0.93,
+        confidence: t!.measured ? 0.93 : 0.75,
         resourceIds: [nat.id],
         details: {
-          explanation: `NAT gateways charge per GB processed. VPC Flow Log analysis shows ${pct(share * 100)} of bytes through ${nat.name} are destined for ${objName}/DynamoDB in the same region. Gateway endpoints route that traffic privately at no charge, with a route-table change and no application changes.`,
+          explanation:
+            `NAT gateways charge per GB processed. ${t!.measured ? `Over the last 30 days, ${pct(share * 100)} of the bytes through ${nat.name} went` : `An estimated ${pct(share * 100)} of the bytes through ${nat.name} go (a supplied figure, not measured here)`} to ${objName}/DynamoDB in the same region. Gateway endpoints route that traffic privately at no charge, with a route-table change and no application changes.` +
+            (natBytes && Math.abs(natBytes.trendPerMonth) >= 0.005 ? ` NAT volume is trending ${pctTrend(natBytes.trendPerMonth)}, so the saving moves with it.` : ""),
           evidence: [
-            { label: "NAT data processed", value: `${round(gb / 1024, 1)} TB / month` },
-            { label: "Share to object storage", value: pct(share * 100) },
+            { label: "NAT data processed", value: `${round(gb / 1024, 1)} TB / month${natBytes ? ` (${pctTrend(natBytes.trendPerMonth)})` : ""}` },
+            { label: "Share to object storage", value: `${pct(share * 100)}${t!.measured ? " (measured, 30 days)" : " (supplied, not measured)"}` },
             { label: "Per-GB processing fee", value: `$${PRICES.natGateway[p].perGb}/GB` },
           ],
           benefits: ["Removes per-GB NAT charge for storage traffic", "Traffic stays on the provider backbone", "Enables bucket policies restricted to your VPC"],
@@ -376,6 +446,10 @@ export const natToEndpoints: Detector = (estate) =>
           implementation: [{ phase: "Add endpoints", weeks: "Day 1–3", tasks: ["Create gateway endpoints for S3 and DynamoDB", "Attach to private route tables", "Verify with VPC Flow Logs"] }],
           terraform: p === "aws" ? tfVpcEndpoints({ vpcId: nat.config.role ?? "vpc-0abc123", region: nat.region }) : undefined,
           rollout: { startWeek: 0, fullWeek: 1 },
+          usage: evidence(natBytes?.days ?? 0, ["NAT bytes", "bytes to storage"], [
+            chartOf(natBytes, "nat", "NAT data processed — GB per day"),
+            chartOf(nat.usage?.metrics.nat_storage_bytes, "nat-storage", `To ${objName} — GB per day`),
+          ]),
         },
       });
     });
@@ -386,9 +460,18 @@ export const natToEndpoints: Detector = (estate) =>
 export const databaseServerless: Detector = (estate) => {
   const out: RecommendationDraft[] = [];
   for (const db of estate.resources.filter((r) => (r.kind === "db.instance" || r.kind === "db.vcore") && r.environment === "prod")) {
-    const cpuAvg = db.metrics.cpuAvg ?? 100;
-    const peak = db.metrics.peakToAvg ?? 1;
+    const cpu = cpuSignal(db);
+    if (!cpu) continue;
+    const cpuAvg = cpu.avg;
+    const peak = cpu.profile?.peakToAvg ?? db.metrics.peakToAvg ?? 1;
     if (cpuAvg > 25 || peak < 2.5) continue;
+    if (!enoughHistory(cpu)) {
+      recordGap(estate, db, "arch.db_serverless", "short_history", `Only ${Math.round(cpu.days)} days of load history; ${MIN_HISTORY_DAYS} are needed to size serverless capacity.`);
+      continue;
+    }
+    // Size for the load expected in 90 days, from the hour-of-week curve when history exists.
+    const growth = 1 + Math.max(0, cpu.trendPerMonth) * 3;
+    const loadProfile = (cpu.profile?.howAvg ?? db.metrics.hourly)?.map((h) => h * growth);
     const p = db.provider;
     const storageGb = db.config.sizeGb ?? 200;
     let maxUnits: number;
@@ -400,7 +483,7 @@ export const databaseServerless: Detector = (estate) => {
       const vm = resolveVm(db.sku?.replace(/^db\./, ""));
       maxUnits = Math.max(2, Math.round((vm?.memGiB ?? 32) / 2));
       minUnits = 0.5;
-      units = round(billedCapacity(maxUnits, db.metrics.hourly, cpuAvg, minUnits), 1);
+      units = round(billedCapacity(maxUnits, loadProfile, cpuAvg * growth, minUnits), 1);
       components = [
         { id: "writer", kind: "db.serverless", provider: p, label: "Aurora Serverless v2 — writer", region: db.region, usage: { capacityUnits: units, storageGb } },
         ...(db.config.multiAz ? [{ id: "reader", kind: "db.serverless" as const, provider: p, label: "Aurora Serverless v2 — reader (HA)", region: db.region, usage: { capacityUnits: units, storageGb: 0 } }] : []),
@@ -409,7 +492,7 @@ export const databaseServerless: Detector = (estate) => {
     } else if (p === "azure") {
       maxUnits = db.config.vcores ?? 8;
       minUnits = Math.max(0.5, maxUnits / 8);
-      units = round(billedCapacity(maxUnits, db.metrics.hourly, cpuAvg, minUnits), 1);
+      units = round(billedCapacity(maxUnits, loadProfile, cpuAvg * growth, minUnits), 1);
       components = [{ id: "db", kind: "db.serverless", provider: p, label: "Azure SQL Database — Serverless", region: db.region, usage: { capacityUnits: units, storageGb } }];
       tf = tfAzureSqlServerless({ name: db.name, maxVcores: maxUnits, minVcores: minUnits });
     } else continue;
@@ -449,10 +532,17 @@ export const databaseServerless: Detector = (estate) => {
         confidence: 0.82,
         resourceIds: [db.id],
         details: {
-          explanation: `${db.name} is provisioned for its daily peak but sits at ${pct(cpuAvg)} average CPU. Using the observed 24-hour load profile, ${dbName} would bill an average of ${units} ${PRICES.dbServerless[p].unit} (min ${minUnits}, max ${maxUnits}), which tracks demand hour by hour.`,
+          explanation:
+            `${db.name} is provisioned for its peak but sits at ${pct(cpuAvg)} average CPU. ` +
+            (cpu.profile?.howAvg
+              ? `Replaying its measured hour-of-week load curve (${Math.round(cpu.days)} days of history${growth > 1.005 ? `, scaled for ${pctTrend(cpu.trendPerMonth)} growth over 90 days` : ""}), `
+              : `Using its daily load profile, `) +
+            `${dbName} would bill an average of ${units} ${PRICES.dbServerless[p].unit} (min ${minUnits}, max ${maxUnits}), tracking demand hour by hour.`,
           evidence: [
+            { label: "History", value: cpu.source === "history" ? `${Math.round(cpu.days)} days, hourly` : "Summary metrics only" },
             { label: "Average CPU", value: pct(cpuAvg) },
             { label: "Peak-to-average", value: `${peak.toFixed(1)}×` },
+            { label: "Load trend", value: pctTrend(cpu.trendPerMonth) },
             { label: "Modelled billed capacity", value: `${units} ${PRICES.dbServerless[p].unit} avg` },
           ],
           benefits: ["Capacity follows load hour by hour", "No resize maintenance windows", "Same engine and drivers"],
@@ -470,6 +560,7 @@ export const databaseServerless: Detector = (estate) => {
           ],
           terraform: tf,
           rollout: { startWeek: 2, fullWeek: 3 },
+          usage: evidence(cpu.days, ["CPU (hourly)"], [chartOf(db.usage?.metrics.cpu_max ?? db.usage?.metrics.cpu, "cpu", "CPU — daily peak")], cpu.profile?.howAvg ? { heatmap: { title: "Load by hour of week", values: cpu.profile.howAvg.map((v) => round(v, 1)) } } : {}),
         },
       }),
     );
@@ -486,9 +577,21 @@ export const appPlanToContainers: Detector = (estate) =>
     .map((plan) => {
       const p = plan.provider;
       const vcpuPerInstance = plan.sku === "P3v3" ? 8 : plan.sku === "P2v3" ? 4 : 2;
-      const usedVcpu = (plan.quantity * vcpuPerInstance * (plan.metrics.cpuAvg ?? 10)) / 100;
+      const planCpu = cpuSignal(plan);
+      // Replicas follow the hour-of-week load curve, scaled to the load expected in 90 days.
+      const planGrowth = 1 + Math.max(0, planCpu?.trendPerMonth ?? 0) * 3;
+      const vcpus = plan.quantity * vcpuPerInstance;
+      const cpuAvg = planCpu?.avg ?? plan.metrics.cpuAvg ?? 10;
+      const usedVcpu = ((vcpus * cpuAvg) / 100) * planGrowth;
       const minReplicas = 2;
-      const replicaHours = Math.max(minReplicas * HOURS_PER_MONTH, (usedVcpu * 1.3 * HOURS_PER_MONTH) / 0.5);
+      const replicasFor = (cpuPct: number) => Math.max(minReplicas, (((vcpus * cpuPct) / 100) * 1.3) / 0.5);
+      const how = planCpu?.profile?.howAvg;
+      const avgReplicas = how ? how.reduce((a, h) => a + replicasFor(h * planGrowth), 0) / how.length : replicasFor(cpuAvg * planGrowth);
+      const peakReplicas = Math.ceil(replicasFor(planCpu?.forecastPeak ?? cpuAvg * 2));
+      const maxReplicas = Math.max(10, Math.ceil(peakReplicas * 1.5));
+      const replicaHours = avgReplicas * HOURS_PER_MONTH;
+      // Requests are a small part of the bill; when they are not measured a nominal volume is priced and flagged.
+      const requestsMeasured = plan.metrics.requestsPerMonthM !== undefined;
       const reqM = plan.metrics.requestsPerMonthM ?? 30;
       const ca = serviceName("compute.container", p);
       const current = specFromResources("Current architecture", p, [plan],
@@ -503,10 +606,10 @@ export const appPlanToContainers: Detector = (estate) =>
         [{ id: "ca", kind: "compute.container", provider: p, label: `${ca} — 0.5 vCPU / 1 GiB replicas`, region: plan.region, usage: { count: 1, activeHours: round(replicaHours), vcpu: 0.5, memGb: 1, requestsM: reqM } }],
         [
           { id: "users", label: "Users", icon: "users", layer: 0 },
-          { id: "ca", label: ca, sublabel: `${minReplicas}–30 replicas`, icon: "container", layer: 1, provider: p, highlight: "added" },
+          { id: "ca", label: ca, sublabel: `${minReplicas}–${maxReplicas} replicas`, icon: "container", layer: 1, provider: p, highlight: "added" },
         ],
         [{ from: "users", to: "ca" }],
-        [`HTTP-driven autoscaling ${minReplicas}–30 replicas`, "Per-second billing", "Same container image, revisions for blue/green"],
+        [`HTTP-driven autoscaling ${minReplicas}–${maxReplicas} replicas (about ${round(avgReplicas, 1)} on average, ${peakReplicas} at peak)`, "Per-second billing", "Same container image, revisions for blue/green"],
       );
       return makeDraft({
         fingerprint: `arch.app_platform:${plan.id}`,
@@ -525,11 +628,18 @@ export const appPlanToContainers: Detector = (estate) =>
         confidence: 0.85,
         resourceIds: [plan.id],
         details: {
-          explanation: `${plan.name} reserves ${plan.quantity * vcpuPerInstance} vCPUs but uses about ${round(usedVcpu, 1)} on average. ${ca} bills only for replica-seconds used and scales on concurrent requests, so capacity follows demand.`,
+          explanation:
+            `${plan.name} reserves ${vcpus} vCPUs but uses about ${round(usedVcpu, 1)} on average. ` +
+            (how
+              ? `Replaying its hour-of-week load curve (${Math.round(planCpu!.days)} days of history, trend ${pctTrend(planCpu!.trendPerMonth)}, scaled to the load expected in 90 days), it needs ${round(avgReplicas, 1)} half-vCPU replicas on average and ${peakReplicas} at peak. `
+              : `Only average CPU is available (no hourly history), so the replica count is estimated from the average. `) +
+            `${ca} bills only for replica-seconds used and scales on concurrent requests, so capacity follows demand.`,
           evidence: [
-            { label: "Provisioned vCPU", value: `${plan.quantity * vcpuPerInstance}` },
-            { label: "Used vCPU (avg)", value: `${round(usedVcpu, 1)}` },
-            { label: "Requests / month", value: `${reqM}M` },
+            { label: "Provisioned vCPU", value: `${vcpus}` },
+            { label: "Used vCPU (avg, 90-day forecast)", value: `${round(usedVcpu, 1)}` },
+            { label: "Replicas needed", value: `${round(avgReplicas, 1)} average · ${peakReplicas} at peak` },
+            { label: "Requests / month", value: requestsMeasured ? `${Math.round(reqM)}M` : `not measured (${Math.round(reqM)}M assumed)` },
+            ...(planCpu?.source === "history" ? [{ label: "CPU trend", value: pctTrend(planCpu.trendPerMonth) }] : []),
           ],
           benefits: ["Pay for replica-seconds, not reserved instances", "Scale to demand automatically", "Revision-based blue/green deploys"],
           risks: ["Deployment slots map to revisions — update pipelines", "Min replicas kept at 2 to avoid cold starts"],
@@ -544,7 +654,9 @@ export const appPlanToContainers: Detector = (estate) =>
             { phase: "Containerize", weeks: "Week 1", tasks: ["Build container image from the current app", "Create Container Apps environment in the same VNet"] },
             { phase: "Shadow & cutover", weeks: "Weeks 2–3", tasks: ["Split traffic 10/90 via Front Door", "Move to 100% and delete the plan"] },
           ],
-          terraform: tfContainerApps({ name: plan.name, minReplicas }),
+          terraform: tfContainerApps({ name: plan.name, minReplicas, maxReplicas }),
+          assumptions: [`0.5 vCPU / 1 GiB replicas with 30% headroom, at least ${minReplicas} running`, ...(requestsMeasured ? [] : [`Request volume is not measured: ${Math.round(reqM)}M requests/month assumed`])],
+          usage: evidence(planCpu?.days ?? 0, ["CPU", "requests"], [chartOf(plan.usage?.metrics.cpu, "cpu", "CPU — daily p95"), chartOf(plan.usage?.metrics.requests, "requests", "Requests per day")]),
           rollout: { startWeek: 2, fullWeek: 3 },
         },
       });
@@ -553,19 +665,53 @@ export const appPlanToContainers: Detector = (estate) =>
 /* ------------------------------------------------------------------------- */
 /* 6. Over-provisioned Kubernetes node pools → bin-pack + spot pool            */
 /* ------------------------------------------------------------------------- */
+/** Packing density the scheduler can safely reach once pod requests are right-sized. */
+const K8S_TARGET_CPU = 0.65;
+const K8S_TARGET_MEM = 0.75;
+const K8S_MIN_NODES = 3;
+
 export const kubernetesSpotConsolidation: Detector = (estate) => {
   const out: RecommendationDraft[] = [];
-  for (const pool of estate.resources.filter((r) => r.kind === "compute.vm" && r.config.role === "k8s-node" && (r.metrics.cpuAvg ?? 100) < 35)) {
+  for (const pool of estate.resources.filter((r) => r.kind === "compute.vm" && r.config.role === "k8s-node" && r.state === "running" && r.quantity > 0 && (r.metrics.cpuAvg ?? 100) < 35)) {
     const vm = resolveVm(pool.sku);
     if (!vm) continue;
     const p = pool.provider;
     const statelessShare = pool.config.statelessShare ?? 0.5;
-    const usedVcpu = (pool.quantity * vm.vcpu * (pool.metrics.cpuAvg ?? 30)) / 100;
-    const usedMem = (pool.quantity * vm.memGiB * (pool.metrics.memP95 ?? 50)) / 100;
-    const needed = Math.ceil(Math.max(usedVcpu / (vm.vcpu * 0.65), usedMem / (vm.memGiB * 0.75)));
-    const onDemand = Math.max(3, Math.ceil(needed * (1 - statelessShare)));
-    const spot = Math.max(1, Math.ceil(needed * statelessShare));
-    if (onDemand + spot >= pool.quantity) continue;
+    const poolCpu = cpuSignal(pool);
+    const poolMem = memSignal(pool);
+    if (!poolCpu) continue;
+    if (!poolMem) {
+      recordGap(estate, pool, "arch.k8s_spot", "missing_metric", `Nodes average ${pct(poolCpu.avg)} CPU, so the pool looks over-provisioned — but node memory is not measured, and memory usually decides how tightly pods can be packed.`, MEMORY_AGENT_FIX[pool.provider]);
+      continue;
+    }
+    if (!enoughHistory(poolCpu)) {
+      recordGap(estate, pool, "arch.k8s_spot", "short_history", `Only ${Math.round(poolCpu.days)} days of node utilisation; ${MIN_HISTORY_DAYS} are needed before shrinking the pool.`);
+      continue;
+    }
+
+    // Nodes needed to carry a given utilisation of today's pool at the target packing density.
+    const nodesFor = (cpuPct: number, memPct: number) => Math.max((pool.quantity * cpuPct) / 100 / K8S_TARGET_CPU, (pool.quantity * memPct) / 100 / K8S_TARGET_MEM);
+    const fit = (n: number) => Math.min(pool.quantity, Math.max(K8S_MIN_NODES, Math.ceil(n - 1e-9)));
+    // Size for the utilisation expected in 90 days.
+    const cpuGrowth = 1 + Math.max(0, poolCpu.trendPerMonth) * 3;
+    const memGrowth = poolMem.peak > 0 ? poolMem.forecastPeak / poolMem.peak : 1;
+    const cpuHow = poolCpu.profile?.howP95;
+    const memHow = poolMem.profile?.howP95;
+    const hourly = cpuHow && memHow && cpuHow.length === memHow.length;
+    // With history the cluster autoscaler is modelled hour by hour over the week; with summary metrics
+    // only the average and the peak are known.
+    const perHour = hourly ? cpuHow.map((c, h) => fit(nodesFor(c * cpuGrowth, memHow[h] * memGrowth))) : [fit(nodesFor(poolCpu.avg * cpuGrowth, poolMem.forecastPeak))];
+    const peakNodes = hourly ? Math.max(...perHour) : fit(nodesFor(poolCpu.forecastPeak, poolMem.forecastPeak));
+    const avgNodes = perHour.reduce((a, b) => a + b, 0) / perHour.length;
+    if (avgNodes > pool.quantity * 0.85) continue; // already packed within 15% of what is needed
+
+    // Stateful and system pods stay on an on-demand pool sized for the peak; everything else autoscales on Spot.
+    const onDemand = Math.min(peakNodes, Math.max(K8S_MIN_NODES, Math.ceil(peakNodes * (1 - statelessShare) - 1e-9)));
+    const spotPerHour = perHour.map((n) => Math.max(0, n - onDemand));
+    const spotMax = Math.max(1, peakNodes - onDemand);
+    const spotMin = Math.min(spotMax, Math.min(...spotPerHour));
+    const spotAvg = round(Math.max(0.5, spotPerHour.reduce((a, b) => a + b, 0) / spotPerHour.length), 1);
+    const spotRange = spotMin === spotMax ? `${spotMax}` : `${spotMin}–${spotMax}`;
     const k8s = serviceName("compute.k8s_control_plane", p);
     const current = specFromResources("Current architecture", p, [pool],
       [
@@ -573,21 +719,22 @@ export const kubernetesSpotConsolidation: Detector = (estate) => {
         { id: "pool", label: "Node pool", sublabel: `${pool.sku}, on-demand`, icon: "vm", layer: 1, count: pool.quantity, provider: p, highlight: "changed" },
       ],
       [{ from: "cp", to: "pool" }],
-      [`${pool.quantity} × ${pool.sku} on-demand nodes`, `${pct(pool.metrics.cpuAvg ?? 0)} avg CPU — requests far above usage`],
+      [`${pool.quantity} × ${pool.sku} on-demand nodes, fixed size`, `${pct(poolCpu.avg)} average CPU — requests far above usage`],
     );
     const proposed = buildArchitecture(`Proposed: bin-packed on-demand pool + autoscaled Spot pool`, p,
       [
         { id: "od", kind: "compute.vm", provider: p, label: `System/stateful pool — ${onDemand} × ${pool.sku}`, sku: pool.sku!, region: pool.region, usage: { count: onDemand } },
-        { id: "spot", kind: "compute.vm", provider: p, label: `Spot pool — ~${spot} × ${pool.sku} (autoscaled)`, sku: pool.sku!, region: pool.region, usage: { count: spot, spot: true, hours: HOURS_PER_MONTH * 1.1 } },
+        { id: "spot", kind: "compute.vm", provider: p, label: `Spot pool — ${spotRange} × ${pool.sku} (autoscaled, ~${spotAvg} on average)`, sku: pool.sku!, region: pool.region, usage: { count: spotAvg, spot: true, hours: HOURS_PER_MONTH * 1.1 } },
       ],
       [
         { id: "cp", label: `${k8s} control plane`, icon: "k8s", layer: 0, provider: p },
         { id: "od", label: "On-demand pool", sublabel: "system + stateful", icon: "vm", layer: 1, count: onDemand, provider: p, highlight: "changed" },
-        { id: "spot", label: "Spot pool", sublabel: "stateless, autoscaled", icon: "vm", layer: 1, count: spot, provider: p, highlight: "added" },
+        { id: "spot", label: "Spot pool", sublabel: `stateless, autoscaled ${spotRange}`, icon: "vm", layer: 1, count: Math.max(1, Math.round(spotAvg)), provider: p, highlight: "added" },
       ],
       [{ from: "cp", to: "od" }, { from: "cp", to: "spot" }],
-      [`Right-size pod requests (VPA recommendations)`, `${onDemand} on-demand nodes for system + stateful pods`, `~${spot} Spot nodes for ${pct(statelessShare * 100)} stateless pods`],
+      [`Right-size pod requests (VPA recommendations)`, `${onDemand} on-demand nodes for system + stateful pods`, `${spotRange} Spot nodes for the ${pct(statelessShare * 100)} of pods that are stateless (~${spotAvg} on average)`],
     );
+    if (proposed.monthlyCost >= current.monthlyCost) continue;
     out.push(
       makeDraft({
         fingerprint: `arch.k8s_spot:${pool.id}`,
@@ -596,38 +743,51 @@ export const kubernetesSpotConsolidation: Detector = (estate) => {
         provider: p,
         accountId: pool.accountId,
         title: `Bin-pack ${pool.name} and move stateless pods to a Spot node pool`,
-        summary: `${pool.quantity} nodes run at ${pct(pool.metrics.cpuAvg ?? 0)} CPU. Right-sized pod requests fit on ${onDemand + spot} nodes, and ${pct(statelessShare * 100)} of pods can use Spot.`,
+        summary: `${pool.quantity} nodes run at ${pct(poolCpu.avg)} CPU. Right-sized pod requests need ${peakNodes} nodes at peak${hourly && round(avgNodes, 1) < peakNodes ? ` and ${round(avgNodes, 1)} on average` : ""}, and ${pct(statelessShare * 100)} of pods can use Spot.`,
         currentMonthlyCost: current.monthlyCost,
         projectedMonthlyCost: proposed.monthlyCost,
         migrationCost: migrationCostFromWeeks(2),
         effort: "medium",
         risk: "medium",
         timeline: "2–3 weeks",
-        confidence: 0.8,
+        confidence: hourly ? 0.82 : 0.7,
         resourceIds: [pool.id],
         details: {
-          explanation: `Pod resource requests on ${pool.name} are far above actual usage (≈${round(usedVcpu)} of ${pool.quantity * vm.vcpu} vCPUs used). Right-sizing requests lets the scheduler pack onto ${needed} nodes. Stateless deployments (${pct(statelessShare * 100)} of pods) then move to an autoscaled Spot pool, with ~10% capacity overhead for evictions.`,
+          explanation:
+            `Pod resource requests on ${pool.name} are far above actual usage: nodes average ${pct(poolCpu.avg)} CPU and ${pct(poolMem.p95)} memory (p95). ` +
+            (hourly
+              ? `Replaying ${Math.round(poolCpu.days)} days of hourly node utilisation at a packing density of ${pct(K8S_TARGET_CPU * 100)} CPU / ${pct(K8S_TARGET_MEM * 100)} memory${cpuGrowth > 1.005 || memGrowth > 1.005 ? ", scaled to the usage expected in 90 days" : ""}, the cluster needs ${peakNodes} nodes in its busiest hour of the week and ${round(avgNodes, 1)} on average, instead of ${pool.quantity} around the clock. `
+              : `Only summary metrics are available (no hourly history), so the estimate uses the average for the bill and the p95 for the peak: about ${round(avgNodes)} nodes on average and ${peakNodes} at peak, instead of ${pool.quantity}. `) +
+            `System and stateful pods stay on ${onDemand} on-demand nodes; the ${pct(statelessShare * 100)} of pods that are stateless move to an autoscaled Spot pool (${spotRange} nodes), with ~10% capacity overhead for evictions.`,
           evidence: [
             { label: "Nodes", value: `${pool.quantity} × ${pool.sku}` },
-            { label: "Average CPU", value: pct(pool.metrics.cpuAvg ?? 0) },
-            { label: "Memory p95", value: pct(pool.metrics.memP95 ?? 0) },
+            { label: "History", value: poolCpu.source === "history" ? `${Math.round(poolCpu.days)} days, hourly` : "Summary metrics only" },
+            { label: "Average CPU", value: `${pct(poolCpu.avg)} (${pctTrend(poolCpu.trendPerMonth)})` },
+            { label: "Memory p95", value: `${pct(poolMem.p95)} → ${pct(poolMem.forecastPeak)} in 90 days` },
+            { label: "Nodes needed", value: `${peakNodes} at peak · ${round(avgNodes, 1)} on average` },
             { label: "Stateless pod share", value: pct(statelessShare * 100) },
           ],
-          benefits: ["Fewer, better-utilised nodes", "Spot pricing for interruption-tolerant pods", "Autoscaler removes idle capacity at night"],
+          benefits: ["Fewer, better-utilised nodes", "Spot pricing for interruption-tolerant pods", "Autoscaler removes idle capacity in quiet hours"],
           risks: ["Spot evictions need PodDisruptionBudgets and graceful shutdown", "Aggressive bin-packing reduces burst headroom"],
           current,
           proposed,
           comparison: [
             { metric: "Monthly cost", current: money(current.monthlyCost), proposed: money(proposed.monthlyCost), change: "better" },
-            { metric: "Node count", current: `${pool.quantity}`, proposed: `${onDemand} + ~${spot} spot`, change: "better" },
+            { metric: "Node count", current: `${pool.quantity}`, proposed: `${onDemand} + ${spotRange} Spot`, change: "better" },
             { metric: "Resilience", current: "Static", proposed: "Autoscaled, multi-pool", change: "better" },
           ],
           implementation: [
             { phase: "Right-size requests", weeks: "Week 1", tasks: ["Apply VPA recommendations to top 20 deployments", "Enable cluster autoscaler least-waste expander"] },
-            { phase: "Spot pool", weeks: "Week 2", tasks: ["Create Spot pool with taints", "Add tolerations + PDBs to stateless deployments"] },
+            { phase: "Spot pool", weeks: "Week 2", tasks: [`Create an autoscaled Spot pool (${spotMin}–${spotMax * 2} nodes) with taints`, "Add tolerations + PDBs to stateless deployments"] },
             { phase: "Shrink on-demand pool", weeks: "Week 3", tasks: [`Scale on-demand pool to ${onDemand}`] },
           ],
-          terraform: p === "azure" ? tfAksSpot({ cluster: pool.name, vmSize: pool.sku!, max: spot * 2 }) : undefined,
+          terraform: p === "azure" ? tfAksSpot({ cluster: pool.name, vmSize: pool.sku!, max: spotMax * 2 }) : undefined,
+          usage: evidence(
+            poolCpu.days,
+            ["CPU", "memory"],
+            [chartOf(pool.usage?.metrics.cpu, "cpu", "Node CPU — daily p95"), chartOf(pool.usage?.metrics.mem, "mem", "Node memory — daily p95")],
+            hourly ? { heatmap: { title: "Nodes needed by hour of week", unit: "nodes", values: perHour } } : {},
+          ),
           rollout: { startWeek: 1, fullWeek: 3 },
         },
       }),

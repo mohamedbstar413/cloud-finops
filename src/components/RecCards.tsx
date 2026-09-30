@@ -70,7 +70,11 @@ export function RecListItem({ rec }: { rec: RecRow }) {
           </span>
           {rec.accountName && <span className="text-xs text-muted">· {rec.accountName}</span>}
           <ImpactBadge impact={rec.impact} />
-          {rec.overlapsWith && <Pill className="bg-white text-muted ring-line">Alternative to “{rec.overlapsWith.title.slice(0, 40)}…”</Pill>}
+          {rec.overlapsWith && (
+            <span title={`Alternative to “${rec.overlapsWith.title}” — not counted in totals`}>
+              <Pill className="bg-white text-muted ring-line">Alternative</Pill>
+            </span>
+          )}
         </div>
       </div>
       <div className="shrink-0 text-right">

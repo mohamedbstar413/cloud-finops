@@ -3,7 +3,7 @@
  * the ranked recommendations. Usage: npm run analyze
  */
 import { PrismaClient } from "@prisma/client";
-import { runEngine, totalAtRisk, totalPotentialSavings } from "../src/lib/engine";
+import { runEngineWithCoverage, totalAtRisk, totalPotentialSavings } from "../src/lib/engine";
 import { loadEstate } from "../src/lib/services/estate";
 
 const prisma = new PrismaClient();
@@ -12,7 +12,7 @@ async function main() {
   const org = await prisma.organization.findFirstOrThrow();
   const estate = await loadEstate(org.id);
   const spend = estate.resources.reduce((s, r) => s + r.monthlyCost, 0);
-  const recs = runEngine(estate);
+  const { drafts: recs, gaps, coverage } = runEngineWithCoverage(estate);
   console.log(`${org.name}: ${estate.resources.length} resources, $${Math.round(spend).toLocaleString()}/mo run-rate\n`);
   for (const r of recs) {
     const alt = r.overlapsWith ? `  ↳ alternative to ${r.overlapsWith}` : "";
@@ -22,6 +22,11 @@ async function main() {
   }
   console.log(`\nPotential savings (de-duplicated): $${Math.round(totalPotentialSavings(recs)).toLocaleString()}/mo`);
   console.log(`Spend at risk from anomalies:      $${Math.round(totalAtRisk(recs)).toLocaleString()}/mo`);
+  console.log(`\nUsage history: ${coverage.withHistory} of ${coverage.measurable} measurable resources (${coverage.minDays}–${coverage.maxDays} days)${coverage.unmeasured ? `; ${coverage.unmeasured} with no usage data at all (not evaluated)` : ""}`);
+  if (gaps.length) {
+    console.log(`Held back (${gaps.length}) — the engine did not guess:`);
+    for (const g of gaps) console.log(`  [${g.kind}] ${g.resource} ($${Math.round(g.monthlyCost).toLocaleString()}/mo, ${g.detector}): ${g.reason}${g.fix ? `  → ${g.fix}` : ""}`);
+  }
 }
 
 main().finally(() => prisma.$disconnect());

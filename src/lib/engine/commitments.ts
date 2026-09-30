@@ -1,5 +1,6 @@
 import { PRICES, PROVIDER_LABEL, PROVIDERS } from "../pricing/catalog";
 import type { Estate, RecommendationDraft } from "./types";
+import { cpuSignal, instanceFloor, pctTrend } from "./signals";
 import { makeDraft, money, pct, round } from "./util";
 
 const COVERAGE = 0.8;
@@ -22,7 +23,9 @@ export function commitmentRecommendations(estate: Estate, primary: Recommendatio
         r.environment === "prod" &&
         r.state === "running" &&
         !r.config.interruptible &&
-        ((r.metrics.dutyCycle ?? 0) >= 0.85 || r.config.role === "k8s-node" || r.config.stateless),
+        // "Steady" means instances that run every hour. With history that is the hourly floor of the
+        // running-instance count; with summary metrics only, fall back to the busy share.
+        (r.usage?.metrics.instances ? instanceFloor(r) >= 1 : (r.metrics.dutyCycle ?? 0) >= 0.85 || r.config.role === "k8s-node" || r.config.stateless),
     );
     let baselineNow = 0;
     let baselineAfter = 0;
@@ -31,7 +34,15 @@ export function commitmentRecommendations(estate: Estate, primary: Recommendatio
       baselineNow += r.monthlyCost;
       const rec = claimedBy.get(r.id);
       if (!rec) {
-        baselineAfter += r.monthlyCost;
+        // Commit only to what runs every hour: the p10 of the hourly instance count, not the provisioned maximum.
+        const floor = instanceFloor(r);
+        const always = r.quantity > 0 ? (r.monthlyCost * floor) / r.quantity : r.monthlyCost;
+        // A shrinking workload should not be locked in at today's level.
+        const trend = cpuSignal(r)?.trendPerMonth ?? 0;
+        const kept = always * (trend < -0.05 ? Math.max(0.5, 1 + trend * 3) : 1);
+        baselineAfter += kept;
+        if (floor < r.quantity) lines.push({ label: r.name, value: `${r.quantity} provisioned, ${floor} always running (hourly floor) → ${money(kept)} committed baseline` });
+        else if (kept < always) lines.push({ label: r.name, value: `usage trending ${pctTrend(trend)} → baseline reduced to ${money(kept)}` });
         continue;
       }
       // Post-optimization on-demand VM spend implied by the recommendation.
@@ -71,7 +82,7 @@ export function commitmentRecommendations(estate: Estate, primary: Recommendatio
         resourceIds: [],
         details: {
           explanation:
-            `Your steady ${PROVIDER_LABEL[p]} compute today is ${money(baselineNow)}/month. After the other open recommendations are applied, the always-on baseline drops to ${money(baselineAfter)}/month. ` +
+            `Your steady ${PROVIDER_LABEL[p]} compute today is ${money(baselineNow)}/month. After the other open recommendations are applied, and counting only instances that run every hour (the hourly floor of autoscaled fleets), the always-on baseline is ${money(baselineAfter)}/month. ` +
             `We size the commitment on that post-optimization baseline at ${pct(COVERAGE * 100)} coverage, so you never commit to capacity you are about to remove. A ${years}-year no-upfront ${c.name} saves ${pct(c[term] * 100)} on the covered usage.`,
           evidence: [
             { label: "Steady compute today", value: money(baselineNow) },

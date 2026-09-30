@@ -14,10 +14,11 @@ import { normalizeComponents } from "../src/lib/ai/normalize";
 import { runEngine, totalPotentialSavings } from "../src/lib/engine";
 import { analyzeHeuristically, parseArchitectureText, serverlessBreakEvenM, type CustomAnalysis, type WorkloadProfile } from "../src/lib/engine/custom";
 import type { ArchitectureSpec, Estate, RecommendationDraft } from "../src/lib/engine/types";
+import { arbitrageWith } from "../src/lib/engine/arbitrage";
 import { planFromKeywords, simulate, TRANSFORM_LABEL, type WhatIfTransform } from "../src/lib/engine/whatif";
 import { downsizeVm, inferVmShape, PROVIDERS, resolveVm } from "../src/lib/pricing/catalog";
 import { COMPONENT_KINDS, priceComponent, priceComponents, type Component } from "../src/lib/pricing/components";
-import { complexEstate, randomArchitecture, randomEstate, rng } from "./fixtures";
+import { assertEngineInvariants, complexEstate, randomArchitecture, randomEstate, resource, rng } from "./fixtures";
 
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -34,47 +35,6 @@ const analyze = (text: string): CustomAnalysis => {
 const kinds = (a: CustomAnalysis) => a.current.components.map((c) => c.kind);
 const vmsOf = (a: CustomAnalysis) => a.current.components.filter((c) => c.kind === "compute.vm");
 const origin = (id: string) => id.split("~")[0];
-
-function assertSpecIntegrity(spec: ArchitectureSpec | undefined, where: string) {
-  if (!spec) return;
-  const ids = spec.nodes.map((n) => n.id);
-  assert.equal(new Set(ids).size, ids.length, `${where}: duplicate diagram node ids`);
-  for (const e of spec.edges) assert.ok(ids.includes(e.from) && ids.includes(e.to), `${where}: edge ${e.from}→${e.to} references a missing node`);
-  const sum = spec.components.reduce((s, c) => s + c.monthlyCost, 0);
-  assert.ok(Math.abs(sum - spec.monthlyCost) < 0.05 + spec.components.length * 0.01, `${where}: spec total ${spec.monthlyCost} ≠ Σ components ${sum}`);
-}
-
-function assertEngineInvariants(estate: Estate, recs: RecommendationDraft[], label: string) {
-  const resourceIds = new Set(estate.resources.map((r) => r.id));
-  const fps = recs.map((r) => r.fingerprint);
-  assert.equal(new Set(fps).size, fps.length, `${label}: duplicate fingerprints`);
-  const primary = recs.filter((r) => !r.overlapsWith);
-  const primaryFps = new Set(primary.map((r) => r.fingerprint));
-  const claimed = new Set<string>();
-  for (const r of recs) {
-    const where = `${label} / ${r.title}`;
-    for (const k of ["currentMonthlyCost", "projectedMonthlyCost", "monthlySavings", "savingsPct", "migrationCost", "confidence"] as const) {
-      assert.ok(finite(r[k]), `${where}: ${k} is not finite (${r[k]})`);
-    }
-    assert.ok(r.monthlySavings >= 0 && r.monthlySavings <= r.currentMonthlyCost + 0.01, `${where}: savings ${r.monthlySavings} outside [0, ${r.currentMonthlyCost}]`);
-    assert.ok(r.projectedMonthlyCost >= 0, `${where}: negative projected cost`);
-    assert.ok(r.savingsPct >= 0 && r.savingsPct <= 100, `${where}: savingsPct ${r.savingsPct}`);
-    assert.ok(r.migrationCost >= 0, `${where}: negative migration cost`);
-    assert.ok(r.details.rollout.startWeek >= 0 && r.details.rollout.startWeek <= r.details.rollout.fullWeek, `${where}: invalid rollout`);
-    for (const id of r.resourceIds) assert.ok(resourceIds.has(id), `${where}: unknown resource ${id}`);
-    if (r.overlapsWith) assert.ok(primaryFps.has(r.overlapsWith), `${where}: overlapsWith points to a non-primary recommendation`);
-    assertSpecIntegrity(r.details.current, `${where} (current)`);
-    assertSpecIntegrity(r.details.proposed, `${where} (proposed)`);
-  }
-  for (const r of primary) {
-    for (const id of r.resourceIds) {
-      assert.ok(!claimed.has(id), `${label}: resource ${id} is claimed by two primary recommendations (double-counted savings)`);
-      claimed.add(id);
-    }
-  }
-  const spend = estate.resources.reduce((s, r) => s + r.monthlyCost, 0);
-  assert.ok(totalPotentialSavings(recs) <= spend + 0.01, `${label}: potential savings exceed total spend`);
-}
 
 function assertCustomInvariants(a: CustomAnalysis, profile: WorkloadProfile, label: string) {
   assert.ok(finite(a.current.monthlyCost) && a.current.monthlyCost >= 0, `${label}: current cost ${a.current.monthlyCost}`);
@@ -349,6 +309,31 @@ describe("engine on a complex connected estate", () => {
   it("moves etl next to its Azure data (egress-aware)", () => {
     const x = recs.find((r) => r.detector === "arch.cross_cloud")!;
     assert.equal(x.targetProvider, "azure");
+  });
+
+  it("does not claim to remove cross-cloud egress that the workload's data sources do not explain", () => {
+    const accounts = [
+      { id: "aws-a", provider: "aws" as const, name: "Prod", externalId: "1", region: "us-east-1" },
+      { id: "az", provider: "azure" as const, name: "Sub", externalId: "3", region: "eastus" },
+    ];
+    const fleet = (config: object) => resource({ id: "fleet", accountId: "aws-a", provider: "aws", kind: "compute.vm", sku: "c5.4xlarge", quantity: 8, workload: "render", metrics: { cpuAvg: 60, cpuP95: 95, cpuMax: 100 }, config: { portable: true, interruptible: true, ...config } });
+    const egress = resource({ id: "az-egress", accountId: "az", provider: "azure", kind: "network.egress", workload: "render", monthlyCost: 5000, metrics: { gbEgress: 60_000 } });
+    const run = (config: object) => arbitrageWith()({ orgId: "t", accounts, resources: [fleet(config), egress], daily: [] })[0];
+
+    // No declared data source: Azure egress tagged to the workload stays in every placement except Azure itself.
+    const unexplained = run({});
+    for (const alt of unexplained.details.alternatives!.filter((a) => !a.label.startsWith("Current"))) {
+      if (alt.provider === "azure") assert.ok(alt.monthlyCost < 5000, `${alt.label}: co-located, the egress is gone`);
+      else assert.ok(alt.monthlyCost > 5000, `${alt.label}: ${alt.monthlyCost} dropped the Azure egress`);
+    }
+    assert.equal(unexplained.targetProvider, "azure", "the only placement that removes it is next to it");
+    assert.match(unexplained.summary, /including \$5,000\/mo of cross-cloud egress it eliminates/);
+
+    // Declared as reads from Azure: same conclusion, now priced from the declared volume.
+    const declared = run({ dataSources: [{ provider: "azure", region: "eastus", gbPerMonth: 60_000, label: "azure-lake" }] });
+    assert.equal(declared.targetProvider, "azure");
+    const awsSpot = declared.details.alternatives!.find((a) => a.provider === "aws" && /Spot/.test(a.label))!;
+    assert.ok(awsSpot.monthlyCost > 4000, "staying on AWS keeps paying to read from Azure");
   });
 
   it("keeps same-named workloads in different accounts separate", () => {

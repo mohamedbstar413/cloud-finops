@@ -3,6 +3,7 @@
  * minimal, readable starting points — the AI enrichment step can expand them
  * with context-specific details.
  */
+import type { ScheduleTransition } from "../usage/series";
 
 export function tfServerless(p: { name: string; region: string; memoryMb: number; asyncShare: number }) {
   return `# ${p.name}: ALB + EC2 fleet  →  API Gateway (HTTP) + Lambda + SQS
@@ -68,21 +69,26 @@ resource "aws_lambda_function" "worker" {
 `;
 }
 
-export function tfGcpSpot(p: { name: string; machineType: string; count: number; region: string }) {
-  return `# ${p.name}: move batch fleet to GCP Spot VMs, co-located with its data
-provider "google" { region = "${p.region}" }
+export function tfGcpSpot(p: { name: string; machineType: string; count: number; region: string; spot?: boolean; window?: string }) {
+  const spot = p.spot ?? true;
+  return `# ${p.name}: move batch fleet to GCP ${spot ? "Spot" : "on-demand"} VMs, co-located with its data
+${p.window ? `# Observed busy window: ${p.window}. Keep target_size at 0 and let the job scheduler resize the group for each run.\n` : ""}provider "google" { region = "${p.region}" }
 
 resource "google_compute_instance_template" "${p.name.replace(/-/g, "_")}" {
   name_prefix  = "${p.name}-"
   machine_type = "${p.machineType}"
 
-  scheduling {
+${
+  spot
+    ? `  scheduling {
     provisioning_model          = "SPOT"
     preemptible                 = true
     automatic_restart           = false
     instance_termination_action = "DELETE"
   }
-
+`
+    : ""
+}
   disk {
     source_image = "cos-cloud/cos-stable"
     disk_type    = "pd-balanced"
@@ -100,7 +106,7 @@ resource "google_compute_region_instance_group_manager" "${p.name.replace(/-/g, 
   name               = "${p.name}"
   region             = "${p.region}"
   base_instance_name = "${p.name}"
-  target_size        = ${p.count}
+  target_size        = ${p.window ? `0 # ${p.count} while a run is in progress` : p.count}
   version {
     instance_template = google_compute_instance_template.${p.name.replace(/-/g, "_")}.id
   }
@@ -110,19 +116,20 @@ resource "google_compute_region_instance_group_manager" "${p.name.replace(/-/g, 
 `;
 }
 
-export function tfAwsSpot(p: { name: string; instanceType: string; count: number; region: string }) {
-  return `# ${p.name}: run the fleet on EC2 Spot with capacity-optimized allocation
-provider "aws" { region = "${p.region}" }
+export function tfAwsSpot(p: { name: string; instanceType: string; count: number; region: string; spot?: boolean; window?: string }) {
+  const spot = p.spot ?? true;
+  return `# ${p.name}: ${spot ? "run the fleet on EC2 Spot with capacity-optimized allocation" : "run the fleet only while the job runs"}
+${p.window ? `# Observed busy window: ${p.window}. The group idles at 0 and the job scheduler sets the desired capacity for each run.\n` : ""}provider "aws" { region = "${p.region}" }
 
 resource "aws_autoscaling_group" "${p.name.replace(/-/g, "_")}" {
   name             = "${p.name}"
-  desired_capacity = ${p.count}
+  desired_capacity = ${p.window ? `0 # ${p.count} while a run is in progress` : p.count}
   min_size         = 0
   max_size         = ${p.count * 2}
 
   mixed_instances_policy {
     instances_distribution {
-      on_demand_percentage_above_base_capacity = 0
+      on_demand_percentage_above_base_capacity = ${spot ? 0 : 100}
       spot_allocation_strategy                 = "price-capacity-optimized"
     }
     launch_template {
@@ -249,7 +256,7 @@ resource "azurerm_mssql_database" "${p.name.replace(/-/g, "_")}" {
 `;
 }
 
-export function tfContainerApps(p: { name: string; minReplicas: number }) {
+export function tfContainerApps(p: { name: string; minReplicas: number; maxReplicas?: number }) {
   return `# ${p.name}: App Service Premium plan  →  Azure Container Apps (consumption)
 resource "azurerm_container_app_environment" "main" {
   name                = "${p.name}-env"
@@ -265,7 +272,7 @@ resource "azurerm_container_app" "${p.name.replace(/-/g, "_")}" {
 
   template {
     min_replicas = ${p.minReplicas}
-    max_replicas = 30
+    max_replicas = ${p.maxReplicas ?? 30}
     container {
       name   = "${p.name}"
       image  = "acmecr.azurecr.io/${p.name}:latest"
@@ -393,34 +400,24 @@ ${p.volumes.length > 3 ? `\n# …and ${p.volumes.length - 3} more volumes (or: a
 `;
 }
 
-export function tfSchedule(p: { name: string; region: string; tagKey: string; tagValue: string }) {
-  return `# Stop ${p.name} outside working hours (Mon–Fri 07:00–19:00)
+export function tfSchedule(p: { name: string; region: string; tagKey: string; tagValue: string; schedule: string; starts: ScheduleTransition[]; stops: ScheduleTransition[] }) {
+  const rule = (action: "start" | "stop", t: ScheduleTransition, i: number, many: boolean) => `resource "aws_scheduler_schedule" "${action}${many ? `_${i + 1}` : ""}" {
+  name                         = "${p.name}-${action}${many ? `-${i + 1}` : ""}"
+  schedule_expression          = "cron(0 ${t.hour} ? * ${t.days.join(",")} *)"
+  schedule_expression_timezone = "UTC"
+  flexible_time_window { mode = "OFF" }
+  target {
+    arn      = "arn:aws:scheduler:::aws-sdk:ec2:${action}Instances"
+    role_arn = aws_iam_role.scheduler.arn
+    input    = jsonencode({ InstanceIds = data.aws_instances.${p.tagValue}.ids })
+  }
+}
+`;
+  return `# Run ${p.name} only when it is used: ${p.schedule}
+# (derived from its observed hour-of-week utilisation, with a 1-hour buffer)
 provider "aws" { region = "${p.region}" }
 
-resource "aws_scheduler_schedule" "stop" {
-  name                         = "${p.name}-stop"
-  schedule_expression          = "cron(0 19 ? * MON-FRI *)"
-  schedule_expression_timezone = "Europe/Dublin"
-  flexible_time_window { mode = "OFF" }
-  target {
-    arn      = "arn:aws:scheduler:::aws-sdk:ec2:stopInstances"
-    role_arn = aws_iam_role.scheduler.arn
-    input    = jsonencode({ InstanceIds = data.aws_instances.${p.tagValue}.ids })
-  }
-}
-
-resource "aws_scheduler_schedule" "start" {
-  name                         = "${p.name}-start"
-  schedule_expression          = "cron(0 7 ? * MON-FRI *)"
-  schedule_expression_timezone = "Europe/Dublin"
-  flexible_time_window { mode = "OFF" }
-  target {
-    arn      = "arn:aws:scheduler:::aws-sdk:ec2:startInstances"
-    role_arn = aws_iam_role.scheduler.arn
-    input    = jsonencode({ InstanceIds = data.aws_instances.${p.tagValue}.ids })
-  }
-}
-
+${[...p.stops.map((t, i) => rule("stop", t, i, p.stops.length > 1)), ...p.starts.map((t, i) => rule("start", t, i, p.starts.length > 1))].join("\n")}
 data "aws_instances" "${p.tagValue}" {
   instance_tags = { ${p.tagKey} = "${p.tagValue}" }
 }

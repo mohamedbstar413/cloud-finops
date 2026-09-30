@@ -1,29 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { customAnalysisSchema, discoverySchema, enrichmentSchema, narrativeSchema, whatIfPlanSchema } from "../src/lib/ai/schemas";
-import { demoSnapshot } from "../src/lib/connectors/demo";
-import { DEMO_ACCOUNTS } from "../src/lib/demo/estate";
 import { runEngine, totalAtRisk, totalPotentialSavings } from "../src/lib/engine";
 import { analyzeHeuristically, parseArchitectureText } from "../src/lib/engine/custom";
-import type { Estate, ResourceRow } from "../src/lib/engine/types";
 import { planFromKeywords, simulate } from "../src/lib/engine/whatif";
 import { priceComponent } from "../src/lib/pricing/components";
 import { adoptionAt, project, waterfall } from "../src/lib/projection";
-
-/** Build an in-memory estate from the demo generator (no database needed). */
-function demoEstate(): Estate {
-  const accounts = DEMO_ACCOUNTS.map((a) => ({ id: a.key, provider: a.provider, name: a.name, externalId: a.externalId, region: a.region }));
-  const resources: ResourceRow[] = [];
-  const daily: Estate["daily"] = [];
-  for (const a of DEMO_ACCOUNTS) {
-    const snap = demoSnapshot(a.key, a.externalId);
-    snap.resources.forEach((r) =>
-      resources.push({ ...r, id: `${a.key}:${r.externalId}`, accountId: a.key, provider: a.provider, sku: r.sku ?? null, workload: r.workload ?? null, environment: r.environment ?? null, dependsOn: [] }),
-    );
-    snap.costs.forEach((c) => daily.push({ ...c, accountId: a.key, provider: a.provider, workload: c.workload ?? null }));
-  }
-  return { orgId: "test", accounts, resources, daily };
-}
+import { demoEstate } from "./fixtures";
 
 describe("pricing engine", () => {
   it("prices VMs by the hour with region and spot factors", () => {
@@ -72,7 +55,8 @@ describe("optimization engine", () => {
       assert.ok(!seen.has(id), `resource ${id} claimed twice`);
       seen.add(id);
     }
-    const alt = recs.find((r) => r.detector === "rightsizing.vm" && r.title.includes("api-platform"))!;
+    // The api-platform volumes disappear with the move to serverless, so their gp3 migration is an alternative, not extra savings.
+    const alt = recs.find((r) => r.detector === "storage.gp3" && r.title.includes("api-platform"))!;
     assert.ok(alt.overlapsWith?.startsWith("arch.serverless"));
     assert.ok(totalPotentialSavings(recs) < recs.reduce((s, r) => s + r.monthlySavings, 0));
   });

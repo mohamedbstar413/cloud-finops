@@ -9,6 +9,8 @@ import {
   type PricedProposal,
   type WorkloadProfile,
 } from "../engine/custom";
+import { runEngineWithCoverage } from "../engine";
+import { usageDigest } from "../engine/signals";
 import type { Estate, RecommendationDetails, RecommendationDraft } from "../engine/types";
 import { makeDraft, money, pct, round, slug, specFromResources } from "../engine/util";
 import { narrateFallback, planFromKeywords, TRANSFORM_LABEL, type WhatIfPlan, type WhatIfResult } from "../engine/whatif";
@@ -38,6 +40,8 @@ Hard rules:
 - Do NOT output prices. A deterministic pricing engine prices every component you propose.
 - compute.vm SKUs must come from this list: ${ALLOWED_SKUS.vm}.
 - db.instance SKUs: ${ALLOWED_SKUS.db}. app.plan SKUs: ${ALLOWED_SKUS.app}.
+- Resources may carry a "usage" summary built from weeks of measured history. Size for "peakIn90DaysPct" (the busiest day's peak projected forward at the measured trend), never for the average. Capacity is only needed during "weeklyPattern.busyWindow". "instances.alwaysRunning" is the steady baseline. When a metric says "not measured", treat it as unknown: never propose a change that depends on it being low (for example less memory when memory is not measured).
+- "heldBack" lists resources the rules engine deliberately left alone, with the reason (a missing metric, too little history, growing usage, a host that still serves data). Do not propose the change it held back.
 - Be honest about trade-offs: cold starts, request time limits, egress, lock-in, spot interruptions, operational overhead.
 - Prefer the best savings-to-risk ratio. If a workload is already efficient, say nothing about it.`;
 
@@ -66,6 +70,8 @@ export function summarizeEstate(estate: Estate, minCost = 300) {
         environment: r.environment,
         monthlyCost: round(r.monthlyCost),
         metrics: Object.fromEntries(Object.entries(r.metrics).filter(([k]) => k !== "hourly")),
+        // Peaks, trend, forecast and weekly pattern from the usage history (absent when only summary metrics exist).
+        usage: usageDigest(r),
         config: r.config,
       })),
     }))
@@ -115,6 +121,14 @@ export async function enrichRecommendation(recId: string) {
       proposedComponents: details.proposed?.components.map((c) => ({ label: c.label, kind: c.kind, monthlyCost: c.monthlyCost, pricing: c.pricingNote })),
       alternatives: details.alternatives,
       assumptions: details.assumptions,
+      // The measured history the recommendation rests on: how long, which metrics, and how each is trending.
+      usageHistory: details.usage && {
+        days: details.usage.days,
+        metrics: details.usage.metrics,
+        notMeasured: details.usage.missing,
+        series: details.usage.charts.map((c) => ({ title: c.title, unit: c.unit, latest: c.points.at(-1)?.v, trendPerMonthPct: c.trendPerMonth === undefined ? undefined : Math.round(c.trendPerMonth * 1000) / 10, limits: c.lines })),
+        keptOn: details.usage.heatmap?.schedule,
+      },
     },
     resources: resources.map((r) => ({ name: r.name, service: r.service, sku: r.sku, quantity: r.quantity, metrics: parseJson(r.metrics, {}), config: parseJson(r.config, {}), tags: parseJson(r.tags, []) })),
   };
@@ -126,6 +140,7 @@ export async function enrichRecommendation(recId: string) {
     user:
       "Write the deep-dive for this recommendation for the engineering team that will execute it. " +
       "Explain the mechanism of the savings, the concrete migration plan, how to validate and roll back, and a production-quality Terraform sketch for the target state. " +
+      "Where a usage history is given, refer to it (how many days, the peaks, the trend) and say which metric to watch after the change. " +
       "Keep numbers consistent with the priced components below.\n\n" +
       JSON.stringify(payload),
   });
@@ -151,6 +166,8 @@ export async function discoverArchitectures(orgId: string) {
   const estate = await loadEstate(orgId);
   const workloads = summarizeEstate(estate, 500);
   const existing = await prisma.recommendation.findMany({ where: { orgId }, select: { title: true, resourceIds: true } });
+  // What the rules engine deliberately did not recommend, so the model does not propose it either.
+  const heldBack = runEngineWithCoverage(estate).gaps.map((g) => ({ resourceId: g.resourceId, resource: g.resource, reason: g.reason }));
 
   const { data, model } = await generateStructured<DiscoveryOutput>({
     name: "architecture_discovery",
@@ -160,7 +177,7 @@ export async function discoverArchitectures(orgId: string) {
       "Here is the customer's normalized multi-cloud estate grouped by workload, and the recommendations our rules engine already made. " +
       "Propose up to 4 NEW architecture changes that the rules missed — fundamentally different designs, managed-service substitutions, data-locality moves or cross-cloud placements. " +
       "Each proposal must list the ids of the resources it replaces and the COMPLETE set of components that replace them. Skip workloads where you cannot beat the existing recommendations.\n\n" +
-      JSON.stringify({ workloads, existingRecommendations: existing.map((e) => e.title) }),
+      JSON.stringify({ workloads, existingRecommendations: existing.map((e) => e.title), heldBack }),
     temperature: 0.4,
   });
 
@@ -229,7 +246,11 @@ export async function discoverArchitectures(orgId: string) {
           ],
           implementation: [],
           rollout: { startWeek: Math.max(1, Math.round(weeks / 2)), fullWeek: weeks },
-          assumptions: ["Proposed by the AI advisor; priced by the deterministic pricing engine", `Migration: ${p.migrationEngineerWeeks} engineer-weeks`],
+          assumptions: [
+            "Proposed by the AI advisor; priced by the deterministic pricing engine",
+            ...(replaced.some((r) => r.usage) ? ["Sized by the AI advisor from the usage summary (peaks, trend, weekly pattern) — check it against the usage history before applying"] : ["No usage history for these resources: sizing rests on summary metrics"]),
+            `Migration: ${p.migrationEngineerWeeks} engineer-weeks`,
+          ],
         },
       }),
     );

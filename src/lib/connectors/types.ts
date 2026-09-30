@@ -1,6 +1,7 @@
 import type { ResourceConfig, ResourceMetrics } from "../engine/types";
 import type { Provider } from "../pricing/catalog";
 import type { ComponentKind } from "../pricing/components";
+import type { Series } from "../usage/series";
 
 export interface AwsCredentials {
   roleArn: string;
@@ -40,6 +41,8 @@ export interface NormalizedResource {
   metrics: ResourceMetrics;
   config: ResourceConfig;
   tags: string[];
+  /** Usage history (hourly / daily). Summary metrics are derived from it when present. */
+  series?: Series[];
 }
 
 export interface NormalizedCost {
@@ -54,6 +57,8 @@ export interface NormalizedCost {
 export interface Snapshot {
   resources: NormalizedResource[];
   costs: NormalizedCost[];
+  /** Data that could not be collected (e.g. a metric namespace the role may not read). The sync still succeeds. */
+  warnings?: string[];
 }
 
 export interface ValidationResult {
@@ -78,4 +83,15 @@ export function categorize(service: string): string {
   if (/(bigquery|athena|redshift|synapse|analytics|dataflow|emr|glue)/.test(s)) return "analytics";
   if (/(cloudwatch|log|monitor|insights)/.test(s)) return "observability";
   return "other";
+}
+
+/** Map the many spellings of an environment tag onto the ones the engine knows: prod, staging, dev, test. */
+export function normalizeEnvironment(value: string | undefined | null): string | undefined {
+  const v = value?.trim().toLowerCase();
+  if (!v) return undefined;
+  if (/^(prod|production|prd|live)$/.test(v)) return "prod";
+  if (/^(stag|staging|stage|stg|preprod|pre-prod|uat)$/.test(v)) return "staging";
+  if (/^(dev|development|sandbox)$/.test(v)) return "dev";
+  if (/^(test|testing|qa|ci)$/.test(v)) return "test";
+  return v;
 }

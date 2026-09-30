@@ -1,4 +1,7 @@
 import { buildDemoDaily, demoResourceCost, demoServiceName, DEMO_RESOURCES, type DemoResource } from "../demo/estate";
+import { demoUsage } from "../demo/usage";
+import { profileUsage } from "../usage/series";
+import { summarize } from "../usage/summary";
 import type { NormalizedCost, NormalizedResource, Snapshot } from "./types";
 
 const hex = (s: string, n: number) => {
@@ -25,28 +28,33 @@ function externalId(r: DemoResource, accountExternalId: string) {
   return `projects/${accountExternalId}/${r.kind.split(".")[0]}/${r.name}`;
 }
 
-export function demoSnapshot(accountKey: string, accountExternalId: string, days = 90): Snapshot {
+export function demoSnapshot(accountKey: string, accountExternalId: string, days = 90, end: Date = new Date()): Snapshot {
   const specs = DEMO_RESOURCES.filter((r) => r.account === accountKey);
-  const resources: NormalizedResource[] = specs.map((r) => ({
-    externalId: externalId(r, accountExternalId),
-    name: r.name,
-    kind: r.kind,
-    service: demoServiceName(r),
-    sku: r.sku,
-    region: r.region,
-    workload: r.workload,
-    environment: r.environment,
-    state: "running",
-    quantity: r.quantity ?? 1,
-    monthlyCost: demoResourceCost(r),
-    metrics: r.metrics ?? {},
-    config: r.config ?? {},
-    tags: r.tags ?? [],
-  }));
+  const resources: NormalizedResource[] = specs.map((r) => {
+    const series = demoUsage(r.key, end);
+    return {
+      externalId: externalId(r, accountExternalId),
+      name: r.name,
+      kind: r.kind,
+      service: demoServiceName(r),
+      sku: r.sku,
+      region: r.region,
+      workload: r.workload,
+      environment: r.environment,
+      state: "running",
+      quantity: r.quantity ?? 1,
+      monthlyCost: demoResourceCost(r),
+      // Summary metrics come from the usage history, never the other way round.
+      metrics: series.length ? summarize(profileUsage(series), r.metrics ?? {}) : (r.metrics ?? {}),
+      config: r.config ?? {},
+      tags: r.tags ?? [],
+      series,
+    };
+  });
 
   const byKey = new Map(specs.map((r) => [r.key, r]));
   const agg = new Map<string, NormalizedCost>();
-  for (const d of buildDemoDaily(specs, days)) {
+  for (const d of buildDemoDaily(specs, days, end)) {
     const r = byKey.get(d.resourceKey)!;
     const service = demoServiceName(r);
     const k = `${d.date}|${service}|${r.region}|${r.workload ?? ""}`;

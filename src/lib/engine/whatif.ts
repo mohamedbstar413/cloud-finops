@@ -3,7 +3,8 @@ import { priceComponent } from "../pricing/components";
 import { arbitrageWith } from "./arbitrage";
 import { appPlanToContainers, databaseServerless, kubernetesSpotConsolidation, natToEndpoints, serverlessModernizationWith, staticSiteToCdn } from "./architecture";
 import { commitmentRecommendations } from "./commitments";
-import { dbRightsizing, idleResources, nonProdScheduling, rightsizing, storageTiering } from "./standard";
+import { cpuSignal, isIdleCpu, recordGap } from "./signals";
+import { dbRightsizing, idleNetwork, idleResources, nonProdScheduling, rightsizing, storageTiering } from "./standard";
 import type { Detector, Estate, RecommendationDraft } from "./types";
 import { effectiveRate, groupBy, isFiniteDraft, makeDraft, money, pct, round, sumCost, weightedAvg } from "./util";
 
@@ -71,8 +72,17 @@ const containerizeFleets: Detector = (estate) => {
     if (shapes.some((x) => !x.vm)) continue;
     const count = rs.reduce((s, r) => s + r.quantity, 0);
     if (count <= 0) continue; // e.g. an Auto Scaling group scaled to zero
-    // Used vCPU / memory summed per instance group (fleets can mix instance types).
-    const used = shapes.reduce((s, { r, vm }) => s + r.quantity * vm!.vcpu * ((r.metrics.cpuAvg ?? 30) / 100), 0);
+    // Container capacity follows the CPU the fleet actually uses. Without a measurement there is nothing to size from.
+    const unmeasured = rs.find((r) => !cpuSignal(r));
+    if (unmeasured) {
+      recordGap(estate, unmeasured, "whatif.containers", "missing_metric", "CPU utilisation is not measured, so the container capacity this fleet needs cannot be estimated.");
+      continue;
+    }
+    // Used vCPU summed per instance group (fleets can mix instance types), at the level expected in 90 days.
+    const used = shapes.reduce((s, { r, vm }) => {
+      const cpu = cpuSignal(r)!;
+      return s + r.quantity * vm!.vcpu * ((cpu.avg * (1 + Math.max(0, cpu.trendPerMonth) * 3)) / 100);
+    }, 0);
     const memPerVcpu = shapes.reduce((s, { r, vm }) => s + r.quantity * vm!.memGiB, 0) / shapes.reduce((s, { r, vm }) => s + r.quantity * vm!.vcpu, 0);
     const replicas = Math.max(2, Math.ceil(used * 1.4));
     const p = rs[0].provider;
@@ -160,7 +170,7 @@ const DETECTORS: Record<string, Detector[]> = {
   rightsizing: [rightsizing, dbRightsizing],
   arm: [armMigration],
   storage_tiering: [storageTiering, (e) => idleResources(e).filter((d) => d.detector === "idle.snapshots"), natToEndpoints],
-  remove_idle: [(e) => idleResources(e).filter((d) => d.detector !== "idle.snapshots")],
+  remove_idle: [(e) => idleResources(e).filter((d) => d.detector !== "idle.snapshots"), idleNetwork],
   cheapest_region: [cheapestRegion],
 };
 
@@ -184,7 +194,11 @@ function notEligibleFor(estate: Estate, type: string): { name: string; reason: s
       let reason: string;
       if (rs.some((r) => r.config.role === "k8s-node")) reason = "Kubernetes node pool — optimize pods and nodes instead";
       else if (rs.some((r) => r.config.interruptible)) reason = "Long-running batch jobs exceed function time limits";
-      else if (rs.every((r) => (r.metrics.cpuMax ?? 100) < 5)) reason = "Idle — terminate instead of migrating";
+      else if (rs.every((r) => {
+        const signal = cpuSignal(r);
+        return signal ? isIdleCpu(signal) : false;
+      }))
+        reason = "Idle — terminate instead of migrating";
       else if (rs.some((r) => r.environment && r.environment !== "prod")) reason = "Non-production — schedule it off-hours instead";
       else if (!rs.every((r) => r.config.stateless)) reason = "Stateful service (sessions / local state) — needs refactoring first";
       else reason = `Steady utilisation (avg CPU ${pct(cpu)}) — VMs with commitments are cheaper`;
@@ -213,10 +227,12 @@ export function simulate(estate: Estate, plan: WhatIfPlan): WhatIfResult {
 
   for (const t of transforms) {
     let drafts: RecommendationDraft[];
+    // Detectors record what they held back (missing metrics, short history, growing usage) on the scoped estate.
+    const scoped: Estate = { ...scope(estate, t), gaps: [] };
     if (t.type === "commitments") {
-      drafts = commitmentRecommendations(scope(estate, t), accepted, t.commitmentTerm ?? "1y");
+      drafts = commitmentRecommendations(scoped, accepted, t.commitmentTerm ?? "1y");
     } else {
-      drafts = (DETECTORS[t.type] ?? []).flatMap((d) => d(scope(estate, t))).sort((a, b) => b.monthlySavings - a.monthlySavings);
+      drafts = (DETECTORS[t.type] ?? []).flatMap((d) => d(scoped)).sort((a, b) => b.monthlySavings - a.monthlySavings);
     }
     const items: WhatIfItem[] = [];
     for (const d of drafts) {
@@ -238,7 +254,9 @@ export function simulate(estate: Estate, plan: WhatIfPlan): WhatIfResult {
         migrationCost: d.migrationCost,
       });
     }
-    notEligible.push(...notEligibleFor(scope(estate, t), t.type));
+    notEligible.push(...notEligibleFor(scoped, t.type));
+    // What the data did not support is part of the answer: say which resources were left out, and why.
+    notEligible.push(...(scoped.gaps ?? []).map((g) => ({ name: g.resource, reason: g.fix ? `${g.reason} ${g.fix}.` : g.reason, ids: [g.resourceId] })));
     steps.push({ type: t.type, label: TRANSFORM_LABEL[t.type] ?? t.type, monthlySavings: round(items.reduce((s, i) => s + i.monthlySavings, 0)), items });
   }
 

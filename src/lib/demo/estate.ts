@@ -108,6 +108,16 @@ export const DEMO_RESOURCES: DemoResource[] = [
     metrics: { cpuAvg: 46, cpuP95: 71, cpuMax: 88, memP95: 64, dutyCycle: 0.97 },
   },
   {
+    // No CloudWatch agent on these hosts: CPU and network are measured, memory is not.
+    key: "reporting-workers", account: "aws-prod", provider: aws, name: "reporting-workers", kind: "compute.vm", sku: "m5.2xlarge", region: "us-east-1",
+    workload: "reporting", environment: "prod", quantity: 6, category: "compute", tags: ["app=reporting", "env=prod"],
+  },
+  {
+    // Recently launched and growing ~16%/month: looks oversized today, will not be in a quarter.
+    key: "checkout-api", account: "aws-prod", provider: aws, name: "checkout-api-asg", kind: "compute.vm", sku: "m5.2xlarge", region: "us-east-1",
+    workload: "checkout", environment: "prod", quantity: 8, category: "compute", tags: ["app=checkout", "env=prod"],
+  },
+  {
     key: "batch-fleet", account: "aws-prod", provider: aws, name: "batch-etl-workers", kind: "compute.vm", sku: "c5.4xlarge", region: "us-east-1",
     workload: "batch-etl", environment: "prod", quantity: 8, category: "compute",
     metrics: { cpuAvg: 38, cpuP95: 96, cpuMax: 100, memP95: 71, dutyCycle: 0.36, hourly: profile(2, 95, 0, 8) },
@@ -140,6 +150,15 @@ export const DEMO_RESOURCES: DemoResource[] = [
     key: "nat", account: "aws-prod", provider: aws, name: "prod-vpc-nat", kind: "network.nat_gateway", region: "us-east-1",
     workload: "shared-network", environment: "prod", quantity: 3, usage: { count: 3, gb: 38_912 }, category: "network",
     metrics: { gbProcessed: 38_912 }, config: { s3TrafficShare: 0.72, role: "vpc-0a1b2c3d4e5f" },
+  },
+  {
+    // Left behind by a VPC migration: still billed every hour, no traffic for weeks.
+    key: "old-alb", account: "aws-prod", provider: aws, name: "old-internal-alb", kind: "network.load_balancer", region: "us-east-1",
+    environment: "prod", quantity: 2, usage: { count: 2, gb: 0 }, category: "network", tags: ["vpc=legacy"],
+  },
+  {
+    key: "old-nat", account: "aws-prod", provider: aws, name: "legacy-vpc-nat", kind: "network.nat_gateway", region: "us-east-1",
+    environment: "prod", quantity: 1, usage: { count: 1, gb: 0 }, category: "network", tags: ["vpc=legacy"],
   },
   {
     key: "legacy", account: "aws-prod", provider: aws, name: "legacy-reporting", kind: "compute.vm", sku: "m5.xlarge", region: "us-east-1",
@@ -276,7 +295,7 @@ export function demoServiceName(r: DemoResource): string {
 /* Daily cost history                                                         */
 /* ------------------------------------------------------------------------- */
 
-function rng(seed: number) {
+export function rng(seed: number) {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;
@@ -287,7 +306,7 @@ function rng(seed: number) {
   };
 }
 
-const hash = (s: string) => [...s].reduce((h, c) => (Math.imul(h, 31) + c.charCodeAt(0)) | 0, 7);
+export const hash = (s: string) => [...s].reduce((h, c) => (Math.imul(h, 31) + c.charCodeAt(0)) | 0, 7);
 
 export interface DemoDaily {
   date: string;

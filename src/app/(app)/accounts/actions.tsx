@@ -4,7 +4,7 @@ import clsx from "clsx";
 import { ArrowLeft, MoreHorizontal, Plus, RefreshCw } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { api, CodeBlock, inputClass, Modal, Notice, Spinner } from "@/components/client-ui";
+import { announceJobs, api, CodeBlock, inputClass, Modal, Notice, Spinner } from "@/components/client-ui";
 import { ProviderLogo } from "@/components/ProviderLogo";
 import { buttonClass } from "@/components/ui";
 import type { Provider } from "@/lib/pricing/catalog";
@@ -36,8 +36,9 @@ export function AccountRowActions({ account, canManage, canSync }: { account: { 
         disabled={!canSync || busy !== null}
         onClick={() =>
           run("sync", async () => {
-            const r = await api<{ resources: number; costRows: number; series: number; warnings: string[]; analysis: { recommendations: number } | null }>(`/api/accounts/${account.id}/sync`, { method: "POST" });
-            return `Synced ${r.resources} resources, ${r.series} usage series and ${r.costRows} cost rows · ${r.analysis?.recommendations ?? 0} recommendations${r.warnings.length ? ` · ${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""} (see below)` : ""}`;
+            await api(`/api/accounts/${account.id}/sync`, { method: "POST" });
+            announceJobs();
+            return `Sync of ${account.name} started. Recommendations update when it finishes.`;
           })
         }
         title="Sync now"
@@ -94,11 +95,23 @@ export function AccountRowActions({ account, canManage, canSync }: { account: { 
 
 type Step = "provider" | "form";
 
-export function AddAccountButton({ demoOptions }: { demoOptions: { key: string; label: string }[] }) {
+export function AddAccountButton({
+  demoOptions,
+  label = "Add Account",
+  initialProvider,
+  className,
+  onConnected,
+}: {
+  demoOptions: { key: string; label: string }[];
+  label?: React.ReactNode;
+  initialProvider?: Provider;
+  className?: string;
+  onConnected?: () => void;
+}) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
-  const [step, setStep] = useState<Step>("provider");
-  const [provider, setProvider] = useState<Provider | "demo">("aws");
+  const [step, setStep] = useState<Step>(initialProvider ? "form" : "provider");
+  const [provider, setProvider] = useState<Provider | "demo">(initialProvider ?? "aws");
   const [setup, setSetup] = useState<{ aws: { externalId: string; platformAccount: string; template: string }; azure: { script: string }; gcp: { script: string } } | null>(null);
   const [form, setForm] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -124,8 +137,10 @@ export function AddAccountButton({ demoOptions }: { demoOptions: { key: string; 
               : { provider, name: form.name, projectId: form.projectId, serviceAccountKey: form.serviceAccountKey, billingTable: form.billingTable || undefined, region: form.region || "us-central1" };
       await api("/api/accounts", { body });
       setOpen(false);
-      setStep("provider");
+      setStep(initialProvider ? "form" : "provider");
       setForm({});
+      announceJobs();
+      onConnected?.();
       router.refresh();
     } catch (e) {
       setErr((e as Error).message);
@@ -143,8 +158,14 @@ export function AddAccountButton({ demoOptions }: { demoOptions: { key: string; 
 
   return (
     <>
-      <button className={buttonClass("primary")} onClick={() => setOpen(true)}>
-        <Plus size={14} /> Add Account
+      <button className={className ?? buttonClass("primary")} onClick={() => setOpen(true)}>
+        {typeof label === "string" ? (
+          <>
+            <Plus size={14} /> {label}
+          </>
+        ) : (
+          label
+        )}
       </button>
       <Modal open={open} onClose={() => setOpen(false)} title="Connect a cloud account" wide>
         {step === "provider" ? (

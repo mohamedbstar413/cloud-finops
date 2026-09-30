@@ -53,8 +53,11 @@ export function InviteForm({ canInviteOwner }: { canInviteOwner: boolean }) {
         setBusy(true);
         setMsg(null);
         try {
-          await api("/api/org/members", { body: { email, role } });
-          setMsg({ tone: "success", text: `Invitation recorded for ${email}.` });
+          const r = await api<{ devLink?: string }>("/api/org/members", { body: { email, role } });
+          setMsg({
+            tone: "success",
+            text: r.devLink ? `Invitation created. No email provider is configured, so share this link: ${window.location.origin}${r.devLink}` : `Invitation emailed to ${email}.`,
+          });
           setEmail("");
           router.refresh();
         } catch (x) {
@@ -99,29 +102,5 @@ export function RemoveInvite({ id }: { id: string }) {
     >
       <X size={12} /> Revoke
     </button>
-  );
-}
-
-/** Demo helper: act as another member to preview role-based access. */
-export function ViewAsSwitcher({ members, current }: { members: { userId: string; label: string }[]; current: string }) {
-  const router = useRouter();
-  return (
-    <label className="flex items-center gap-2 text-xs text-muted">
-      View as (demo)
-      <select
-        value={current}
-        onChange={async (e) => {
-          await api("/api/session", { body: { userId: e.target.value } });
-          router.refresh();
-        }}
-        className="h-9 rounded-lg border border-line bg-white px-2 text-[13px] text-ink"
-      >
-        {members.map((m) => (
-          <option key={m.userId} value={m.userId}>
-            {m.label}
-          </option>
-        ))}
-      </select>
-    </label>
   );
 }

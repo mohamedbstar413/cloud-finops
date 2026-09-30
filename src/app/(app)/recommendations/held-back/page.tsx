@@ -1,12 +1,12 @@
 import { HeldBackList } from "@/components/HeldBack";
 import { Card, Empty, PageHeader } from "@/components/ui";
-import { getSession } from "@/lib/auth";
+import { pageSession } from "@/lib/auth";
 import { timeAgo, usd } from "@/lib/format";
 import { getDataCoverage, listRecommendations } from "@/lib/services/queries";
 import { RecommendationsNav } from "../nav";
 
 export default async function HeldBackPage() {
-  const { org } = await getSession();
+  const { org } = await pageSession();
   const [recs, data] = await Promise.all([listRecommendations(org.id), getDataCoverage(org.id)]);
   const gaps = data?.gaps ?? [];
   const c = data?.coverage;

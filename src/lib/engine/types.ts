@@ -129,7 +129,16 @@ export interface Estate {
   daily: DailyCost[];
   /** Filled by detectors while they run (see runEngineWithCoverage). */
   gaps?: DataGap[];
+  /** The organization's policies that change what a recommendation includes. */
+  policy?: EstatePolicy;
 }
+
+export interface EstatePolicy {
+  /** How long the archive backup taken before deleting storage is kept (null = until deleted by hand). */
+  backupRetentionDays: number | null;
+}
+
+export const DEFAULT_POLICY: EstatePolicy = { backupRetentionDays: 365 };
 
 /** A usage chart shown as evidence on a recommendation. */
 export interface UsageChart {

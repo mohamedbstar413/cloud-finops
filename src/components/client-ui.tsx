@@ -137,3 +137,26 @@ export function Select({ value, onChange, options, label, className }: { value: 
 
 export const inputClass =
   "h-9 w-full rounded-lg border border-line bg-white px-3 text-[13px] text-ink outline-none placeholder:text-slate-400 focus:border-brand focus:ring-2 focus:ring-brand/15";
+
+/* ---------------- Background jobs ---------------- */
+
+export interface ClientJob {
+  id: string;
+  type: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  error: string | null;
+  result: unknown;
+}
+
+/** Tell the activity banner that new background work was queued. */
+export const announceJobs = () => window.dispatchEvent(new Event("cpo:jobs"));
+
+/** Follow a background job until it finishes. */
+export async function waitForJob(id: string, onUpdate?: (job: ClientJob) => void, intervalMs = 1200): Promise<ClientJob> {
+  for (;;) {
+    const { job } = await api<{ job: ClientJob }>(`/api/jobs/${id}`);
+    onUpdate?.(job);
+    if (job.status === "succeeded" || job.status === "failed") return job;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}

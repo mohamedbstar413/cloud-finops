@@ -1,0 +1,352 @@
+// Cloud Price Optimizer — provider-agnostic data model.
+// GENERATED from prisma/schema.prisma by scripts/prisma-postgres.ts — do not edit by hand.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// A customer (tenant). Every other record hangs off one organization.
+/// plan: free | pro | enterprise
+model Organization {
+  id                   String           @id @default(cuid())
+  name                 String
+  plan                 String           @default("free")
+  /// The shared, read-only demo organization visitors can explore without signing up.
+  isDemo               Boolean          @default(false)
+  /// JSON OrgSettings (remediation mode, backup retention, sync schedule, notifications, Git)
+  settings             String           @default("{}")
+  /// Per-tenant data key, wrapped by the platform master key (or KMS). Encrypts this org's credentials.
+  dataKey              String?
+  onboardedAt          DateTime?
+  nextSyncAt           DateTime?
+  stripeCustomerId     String?          @unique
+  stripeSubscriptionId String?
+  /// active | trialing | past_due | canceled
+  planStatus           String           @default("active")
+  /// Set when deletion is requested: the organization is inaccessible and its data is removed by a job.
+  deletedAt            DateTime?
+  createdAt            DateTime         @default(now())
+  members              Membership[]
+  sessions             Session[]
+  jobs                 Job[]
+  usageCounters        UsageCounter[]
+  accounts        CloudAccount[]
+  recommendations Recommendation[]
+  scenarios       Scenario[]
+  auditLogs       AuditLog[]
+  invites         Invite[]
+  analysisRuns    AnalysisRun[]
+}
+
+model User {
+  id              String          @id @default(cuid())
+  name            String
+  email           String          @unique
+  /// scrypt hash; null for users who were only invited and never signed up
+  passwordHash    String?
+  emailVerifiedAt DateTime?
+  createdAt       DateTime        @default(now())
+  memberships     Membership[]
+  sessions        Session[]
+  passwordResets  PasswordReset[]
+}
+
+/// A signed-in browser. The cookie holds a random token; only its SHA-256 is stored.
+model Session {
+  id         String       @id @default(cuid())
+  tokenHash  String       @unique
+  userId     String
+  /// The organization this session is working in (a user can belong to several; none right after
+  /// their only organization was deleted).
+  orgId      String?
+  createdAt  DateTime      @default(now())
+  expiresAt  DateTime
+  lastSeenAt DateTime      @default(now())
+  userAgent  String?
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org        Organization? @relation(fields: [orgId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+}
+
+model PasswordReset {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Failed sign-in attempts, for rate limiting (per email and per client address).
+model AuthAttempt {
+  id        String   @id @default(cuid())
+  key       String
+  createdAt DateTime @default(now())
+
+  @@index([key, createdAt])
+}
+
+/// role: owner | admin | member | viewer
+model Membership {
+  id        String       @id @default(cuid())
+  userId    String
+  orgId     String
+  role      String       @default("member")
+  createdAt DateTime     @default(now())
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, orgId])
+}
+
+model Invite {
+  id         String       @id @default(cuid())
+  orgId      String
+  email      String
+  role       String       @default("member")
+  /// SHA-256 of the token in the invitation link
+  tokenHash  String?      @unique
+  invitedBy  String?
+  expiresAt  DateTime?
+  acceptedAt DateTime?
+  createdAt  DateTime     @default(now())
+  org        Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+/// provider: aws | azure | gcp
+/// status: connected | pending | error
+/// permissions: read_only | read_write
+model CloudAccount {
+  id          String       @id @default(cuid())
+  orgId       String
+  provider    String
+  name        String
+  externalId  String
+  region      String
+  status      String       @default("pending")
+  permissions String       @default("read_only")
+  authType    String
+  /// AES-256-GCM encrypted JSON credential blob (role ARN + external id, SP secret, SA key)
+  credentials String?
+  isDemo      Boolean      @default(false)
+  lastSyncAt  DateTime?
+  lastError   String?
+  /// JSON string[]: data the last sync could not collect (e.g. a metric namespace it may not read)
+  syncWarnings String      @default("[]")
+  createdAt   DateTime     @default(now())
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  resources   Resource[]
+  costs       CostRecord[]
+}
+
+/// Normalized resource inventory. `kind` is the provider-agnostic service kind
+/// (see src/lib/pricing/catalog.ts) — e.g. compute.vm, db.relational, storage.object.
+model Resource {
+  id          String       @id @default(cuid())
+  accountId   String
+  provider    String
+  externalId  String
+  name        String
+  kind        String
+  service     String
+  sku         String?
+  region      String
+  workload    String?
+  environment String?
+  state       String       @default("running")
+  quantity    Float        @default(1)
+  monthlyCost Float
+  /// JSON: utilization summary (cpuAvg, cpuP95, cpuMax, memP95, dutyCycle, requestsPerMonth…)
+  metrics     String       @default("{}")
+  /// JSON: configuration (instance family, storage class, access profile, data sources…)
+  config      String       @default("{}")
+  /// JSON: string[] of tags "key=value"
+  tags        String       @default("[]")
+  /// JSON: string[] of resource ids this resource sends traffic to
+  dependsOn   String       @default("[]")
+  createdAt   DateTime     @default(now())
+  account     CloudAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  usage       UsageSeries[]
+
+  @@index([accountId])
+  @@index([workload])
+}
+
+/// Usage history of a resource, stored columnar: one row per metric and
+/// resolution; `values` is a JSON number[] (null = missing sample) starting at
+/// `start`, one sample every `stepMinutes`.
+model UsageSeries {
+  id          String   @id @default(cuid())
+  resourceId  String
+  /// cpu | cpu_max | mem | net_in | net_out | requests | latency_p95 | instances | iops | nat_bytes | nat_storage_bytes | stored_gb | read_gb | egress_gb | scanned_gb | connections
+  metric      String
+  /// avg | max | sum
+  stat        String
+  /// percent | bytes | count | ms | gb | iops
+  unit        String
+  stepMinutes Int
+  start       DateTime
+  values      String
+  resource    Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@unique([resourceId, metric])
+}
+
+/// Daily normalized cost line (FOCUS-style: provider, service, category, region).
+model CostRecord {
+  id        String       @id @default(cuid())
+  accountId String
+  date      DateTime
+  provider  String
+  service   String
+  category  String
+  region    String
+  workload  String?
+  cost      Float
+  account   CloudAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([date])
+  @@index([accountId, date])
+}
+
+/// category: architecture | cross_cloud | rightsizing | idle | commitment | storage | scheduling | anomaly
+/// status: open | in_progress | applied | dismissed | snoozed
+model Recommendation {
+  id                   String       @id @default(cuid())
+  orgId                String
+  fingerprint          String
+  accountId            String?
+  provider             String
+  targetProvider       String?
+  category             String
+  detector             String
+  title                String
+  summary              String
+  impact               String
+  currentMonthlyCost   Float
+  projectedMonthlyCost Float
+  monthlySavings       Float
+  savingsPct           Float
+  migrationCost        Float        @default(0)
+  effort               String
+  risk                 String
+  timeline             String
+  confidence           Float
+  status               String       @default("open")
+  snoozedUntil         DateTime?
+  dismissReason        String?
+  /// JSON string[]
+  resourceIds          String       @default("[]")
+  /// JSON RecommendationDetails (architecture graphs, comparison, steps, terraform, rollout)
+  details              String       @default("{}")
+  /// JSON AI enrichment payload (when OpenAI is configured)
+  ai                   String?
+  aiModel              String?
+  source               String       @default("engine")
+  overlapsWith         String?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  org                  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  tickets              Ticket[]
+
+  @@unique([orgId, fingerprint])
+}
+
+model Ticket {
+  id               String         @id @default(cuid())
+  recommendationId String
+  key              String
+  title            String
+  body             String
+  system           String         @default("internal")
+  url              String?
+  createdAt        DateTime       @default(now())
+  recommendation   Recommendation @relation(fields: [recommendationId], references: [id], onDelete: Cascade)
+}
+
+/// What-if simulations (prompt → plan → deterministic result → narrative)
+model Scenario {
+  id        String       @id @default(cuid())
+  orgId     String
+  prompt    String
+  plan      String
+  result    String
+  narrative String
+  aiModel   String?
+  createdBy String?
+  createdAt DateTime     @default(now())
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id        String       @id @default(cuid())
+  orgId     String
+  actor     String
+  action    String
+  target    String?
+  createdAt DateTime     @default(now())
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+/// One run of the optimization engine: what it evaluated and what it held back (data gaps).
+model AnalysisRun {
+  id              String       @id @default(cuid())
+  orgId           String
+  createdAt       DateTime     @default(now())
+  recommendations Int
+  monthlySavings  Float
+  evaluated       Int
+  withUsage       Int
+  /// JSON DataGap[]
+  gaps            String       @default("[]")
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+/// Background work: account syncs, analyses, scheduled syncs, organization deletion.
+/// type: sync_account | analyze | delete_org
+/// status: queued | running | succeeded | failed
+model Job {
+  id          String       @id @default(cuid())
+  orgId       String
+  type        String
+  /// JSON payload (e.g. { accountId })
+  payload     String       @default("{}")
+  status      String       @default("queued")
+  attempts    Int          @default(0)
+  maxAttempts Int          @default(3)
+  runAt       DateTime     @default(now())
+  lockedBy    String?
+  lockedAt    DateTime?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  error       String?
+  /// JSON result shown to the user
+  result      String?
+  /// Who asked for it ("System" for scheduled work)
+  requestedBy String?
+  createdAt   DateTime     @default(now())
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([status, runAt])
+  @@index([orgId, status])
+}
+
+/// Metered usage per organization and calendar month (e.g. ai_calls, manual_syncs).
+model UsageCounter {
+  id     String       @id @default(cuid())
+  orgId  String
+  metric String
+  /// YYYY-MM (UTC)
+  period String
+  count  Int          @default(0)
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, metric, period])
+}

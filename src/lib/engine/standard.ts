@@ -19,7 +19,7 @@ import {
   type UsageWindow,
 } from "./signals";
 import { tfAzureBlobLifecycle, tfGp3, tfRightsize, tfS3Lifecycle, tfSchedule, tfSnapshotArchive } from "./terraform";
-import type { Detector, Estate, RecommendationDraft, ResourceRow } from "./types";
+import { DEFAULT_POLICY, type Detector, type Estate, type RecommendationDraft, type ResourceRow } from "./types";
 import {
   atEffectiveRate,
   buildArchitecture,
@@ -48,6 +48,13 @@ const HALVE_MEM_LIMIT = 40;
 const TREND_HISTORY_DAYS = 28;
 /** Monitoring agents and health checks alone produce less than this per instance. */
 const IDLE_NETWORK_BYTES_PER_DAY = 100e6;
+/** Disk size assumed for an instance whose volumes are not in the inventory, when pricing its backup. */
+const BACKUP_GB_PER_INSTANCE = 100;
+
+const retentionText = (estate: Estate) => {
+  const d = (estate.policy ?? DEFAULT_POLICY).backupRetentionDays;
+  return d === null ? "until someone deletes it" : d % 365 === 0 ? `for ${d / 365} year${d === 365 ? "" : "s"}` : `for ${d} days`;
+};
 /** Below these daily volumes a load balancer or NAT gateway carries nothing but noise. */
 const IDLE_LB_REQUESTS_PER_DAY = 100;
 const IDLE_NAT_BYTES_PER_DAY = 50e6;
@@ -309,6 +316,10 @@ export const idleResources: Detector = (estate) => {
     const period = history ? `${days} days` : "the metrics window";
     const maxNet = Math.max(0, ...measured.map((i) => i.net! / i.r.quantity));
     const usage = rs[0].usage?.metrics;
+    // Nothing is deleted without a copy: an archive snapshot of the disks is kept, and paid for.
+    const backupGb = rs.reduce((s, r) => s + (r.config.sizeGb ?? BACKUP_GB_PER_INSTANCE) * r.quantity, 0);
+    const backupCost = round(backupGb * PRICES.snapshotArchive[p], 2);
+    const sizesKnown = rs.every((r) => r.config.sizeGb !== undefined);
     out.push(
       makeDraft({
         fingerprint: `idle.vm:${acct}`,
@@ -319,7 +330,7 @@ export const idleResources: Detector = (estate) => {
         title: `Terminate ${n} idle ${serviceName("compute.vm", p)} instance${n > 1 ? "s" : ""}`,
         summary: `${n} instance${n > 1 ? "s" : ""} in ${accountName(estate, acct)} stayed below 5% CPU for ${period}${allNet ? " with almost no network traffic" : ""}.`,
         currentMonthlyCost: cost,
-        projectedMonthlyCost: 0,
+        projectedMonthlyCost: backupCost,
         migrationCost: 0,
         effort: "low",
         risk: "low",
@@ -332,14 +343,15 @@ export const idleResources: Detector = (estate) => {
             (allNet
               ? ` and network traffic (in + out) stayed under ${fmtBytes(maxNet)} per instance per day, which is what monitoring agents alone produce.`
               : `. Network traffic is not measured for ${items.length - measured.length} of them, so CPU is the only signal: confirm with the owners before terminating.`) +
-            ` Snapshot the volumes, stop the instances for a week, then terminate them.`,
+            ` Take an archive-tier snapshot of their disks (kept ${retentionText(estate)}, about ${money(backupCost)}/month), stop the instances for a week, then terminate them.`,
           evidence: items.map((i) => ({
             label: i.r.name,
             value: `${i.r.sku} · ${history ? "busiest day" : "max"} CPU ${pct(history ? i.cpu.peak : i.cpu.max)} · ${i.net === null ? "network not measured" : `${fmtBytes(i.net / i.r.quantity)}/day network`}`,
           })),
-          benefits: ["Removes 100% of their cost", "Smaller attack surface"],
-          risks: ["Confirm with owners (tag: owner) before termination", ...(allNet ? [] : ["Network activity was not measured"])],
-          implementation: [{ phase: "Stop → terminate", weeks: "Day 1–7", tasks: ["Snapshot volumes", "Stop instances and notify owners", "Terminate after 7 days without objection"] }],
+          benefits: ["Removes the compute cost; only the archive backup remains", "Smaller attack surface"],
+          risks: ["Confirm with owners (tag: owner) before termination", "Restoring from an archive snapshot takes 24–72 hours", ...(allNet ? [] : ["Network activity was not measured"])],
+          implementation: [{ phase: "Back up → stop → terminate", weeks: "Day 1–7", tasks: ["Archive-tier snapshot of every disk, and confirm it completed", "Stop instances and notify owners", "Terminate after 7 days without objection"] }],
+          assumptions: [`Backup kept ${retentionText(estate)}`, ...(sizesKnown ? [] : [`Backup priced at ${BACKUP_GB_PER_INSTANCE} GB per instance where disk sizes are not in the inventory`])],
           rollout: { startWeek: 0, fullWeek: 1 },
           usage: evidence(days, allNet ? ["CPU", "network"] : ["CPU"], [
             chartOf(usage?.cpu_max ?? usage?.cpu, "cpu", `CPU — daily peak (${rs[0].name})`, { lines: [{ label: "Idle threshold", value: 5, tone: "limit" }] }),
@@ -374,11 +386,12 @@ export const idleResources: Detector = (estate) => {
         confidence: 0.92,
         resourceIds: rs.map((r) => r.id),
         details: {
-          explanation: `These volumes are unattached ${since}. Take an archive-tier snapshot (kept for audit) and delete the volumes.`,
+          explanation: `These volumes are unattached ${since}. Take an archive-tier snapshot, kept ${retentionText(estate)}, then delete the volumes. The saving shown is net of that backup.`,
           evidence: [{ label: "Unattached volumes", value: `${countOf(rs)} (${round(gb / 1024, 1)} TB)` }],
           benefits: ["Removes orphaned storage spend"],
           risks: ["Restore from archive snapshot takes 24–72 h"],
-          implementation: [{ phase: "Clean up", weeks: "Day 1", tasks: ["Archive-tier snapshot", "Delete volumes"] }],
+          implementation: [{ phase: "Back up, then delete", weeks: "Day 1", tasks: ["Archive-tier snapshot of each volume", "Confirm every snapshot completed", "Delete volumes"] }],
+          assumptions: [`Backup kept ${retentionText(estate)}`],
           rollout: { startWeek: 0, fullWeek: 0 },
         },
       }),
@@ -442,7 +455,7 @@ export const idleResources: Detector = (estate) => {
           benefits: ["Keeps backups for compliance at archive prices"],
           risks: ["Archive restores take 24–72 hours; minimum 90-day retention"],
           implementation: [{ phase: "Policy", weeks: "Week 1", tasks: ["Create a Data Lifecycle Manager archive policy", "Archive existing snapshots in bulk"] }],
-          terraform: p === "aws" ? tfSnapshotArchive() : undefined,
+          terraform: p === "aws" ? tfSnapshotArchive({ retentionDays: (estate.policy ?? DEFAULT_POLICY).backupRetentionDays }) : undefined,
           rollout: { startWeek: 0, fullWeek: 1 },
         },
       }),

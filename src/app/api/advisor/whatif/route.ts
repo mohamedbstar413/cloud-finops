@@ -1,5 +1,7 @@
 import { z } from "zod";
+import { aiEnabled } from "@/lib/ai/client";
 import { route } from "@/lib/api";
+import { consume } from "@/lib/billing/limits";
 import { narrateScenario, planWhatIf } from "@/lib/ai/advisor";
 import { getSession, requirePermission } from "@/lib/auth";
 import { prisma, parseJson } from "@/lib/db";
@@ -13,6 +15,7 @@ const Body = z.object({ prompt: z.string().min(3).max(1000) });
 export const POST = route(async (req: Request) => {
   const { org, user } = await requirePermission("ai:use");
   const { prompt } = Body.parse(await req.json());
+  if (aiEnabled()) await consume(org.id, "ai_calls");
   const estate = await loadEstate(org.id);
   const { plan, source, model } = await planWhatIf(prompt, estate);
   const result = simulate(estate, plan);

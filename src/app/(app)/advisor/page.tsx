@@ -1,12 +1,12 @@
 import { PageHeader, Pill } from "@/components/ui";
 import { aiEnabled, aiModel } from "@/lib/ai/client";
-import { can, getSession } from "@/lib/auth";
+import { can, pageSession } from "@/lib/auth";
 import { countScenarios, listScenarios } from "@/lib/services/scenarios";
 import { AdvisorNav } from "./nav";
 import { AskView } from "./view";
 
 export default async function AdvisorPage({ searchParams }: { searchParams: Promise<{ q?: string }> }) {
-  const { org, role } = await getSession();
+  const { org, role } = await pageSession();
   const [recent, count] = await Promise.all([listScenarios(org.id, 3), countScenarios(org.id)]);
   const ai = aiEnabled();
   return (

@@ -9,7 +9,9 @@ import { loadEstate } from "../src/lib/services/estate";
 const prisma = new PrismaClient();
 
 async function main() {
-  const org = await prisma.organization.findFirstOrThrow();
+  // npm run analyze -- "<organization name or id>"   (default: the demo organization)
+  const which = process.argv[2];
+  const org = await prisma.organization.findFirstOrThrow({ where: which ? { OR: [{ id: which }, { name: which }] } : { isDemo: true } });
   const estate = await loadEstate(org.id);
   const spend = estate.resources.reduce((s, r) => s + r.monthlyCost, 0);
   const { drafts: recs, gaps, coverage } = runEngineWithCoverage(estate);

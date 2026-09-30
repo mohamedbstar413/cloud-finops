@@ -5,7 +5,7 @@ import { RefreshCw, Search, SlidersHorizontal, Sparkles } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
-import { api, inputClass, Notice, Select, Spinner } from "@/components/client-ui";
+import { api, inputClass, Notice, Select, Spinner, waitForJob } from "@/components/client-ui";
 import { Pager } from "@/components/Pager";
 import { RecListItem } from "@/components/RecCards";
 import { buttonClass, Empty } from "@/components/ui";
@@ -21,10 +21,14 @@ export function RecommendationActionsBar({ ai, canRun }: { ai: boolean; canRun: 
     setBusy("run");
     setMsg(null);
     try {
-      const r = await api<{ recommendations: number; architecture: number; monthlySavings: number; heldBack?: number }>("/api/analysis", { method: "POST" });
+      setMsg({ tone: "info", text: "Analysing your estate…" });
+      const { job: queued } = await api<{ job: { id: string } }>("/api/analysis", { method: "POST" });
+      const job = await waitForJob(queued.id);
+      if (job.status === "failed") throw new Error(job.error ?? "Analysis failed");
+      const r = job.result as { recommendations: number; monthlySavings: number; heldBack?: number; created?: number };
       setMsg({
         tone: "success",
-        text: `Analysis complete: ${r.recommendations} recommendations (${r.architecture} architecture), ${usd(r.monthlySavings)}/mo potential.${r.heldBack ? ` ${r.heldBack} resource${r.heldBack > 1 ? "s were" : " was"} held back rather than guessed — see the Held back tab.` : ""}`,
+        text: `Analysis complete: ${r.recommendations} recommendations${r.created ? ` (${r.created} new)` : ""}, ${usd(r.monthlySavings)}/mo potential.${r.heldBack ? ` ${r.heldBack} resource${r.heldBack > 1 ? "s were" : " was"} held back rather than guessed — see the Held back tab.` : ""}`,
       });
       router.refresh();
     } catch (e) {

@@ -1,5 +1,5 @@
 import { prisma } from "../db";
-import { decryptJson } from "../crypto";
+import { decryptForOrg } from "../tenant-crypto";
 import { awsConnector } from "../connectors/aws";
 import { azureConnector } from "../connectors/azure";
 import { gcpConnector } from "../connectors/gcp";
@@ -83,7 +83,7 @@ export async function persistSnapshot(accountId: string, provider: string, snap:
   return { resources: snap.resources.length, costRows: rows.length, series: seriesRows.length };
 }
 
-export async function collectSnapshot(account: { provider: string; isDemo: boolean; externalId: string; credentials: string | null }): Promise<Snapshot> {
+export async function collectSnapshot(account: { orgId: string; provider: string; isDemo: boolean; externalId: string; credentials: string | null }): Promise<Snapshot> {
   if (account.isDemo) {
     const spec = DEMO_ACCOUNTS.find((a) => a.externalId === account.externalId);
     if (!spec) throw new Error("Unknown demo account");
@@ -92,11 +92,11 @@ export async function collectSnapshot(account: { provider: string; isDemo: boole
   if (!account.credentials) throw new Error("No credentials stored for this account");
   switch (account.provider) {
     case "aws":
-      return awsConnector.collect(decryptJson<AwsCredentials>(account.credentials), { days: DAYS });
+      return awsConnector.collect(await decryptForOrg<AwsCredentials>(account.orgId, account.credentials), { days: DAYS });
     case "azure":
-      return azureConnector.collect(decryptJson<AzureCredentials>(account.credentials), { days: DAYS });
+      return azureConnector.collect(await decryptForOrg<AzureCredentials>(account.orgId, account.credentials), { days: DAYS });
     case "gcp":
-      return gcpConnector.collect(decryptJson<GcpCredentials>(account.credentials), { days: DAYS });
+      return gcpConnector.collect(await decryptForOrg<GcpCredentials>(account.orgId, account.credentials), { days: DAYS });
     default:
       throw new Error(`Unsupported provider ${account.provider}`);
   }

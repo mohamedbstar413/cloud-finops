@@ -16,7 +16,8 @@
     "postinstall": "prisma generate",
     "test": "tsx --test tests/*.test.ts",
     "test:stress": "FUZZ_RUNS=10 tsx --test tests/*.test.ts",
-    "fuzz:seed": "tsx scripts/fuzz-seed.ts"
+    "fuzz:seed": "tsx scripts/fuzz-seed.ts",
+    "worker": "tsx scripts/worker.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

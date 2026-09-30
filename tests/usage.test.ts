@@ -506,7 +506,10 @@ describe("idle detection over time", () => {
     assert.equal(gaps.length, 0);
     assert.equal(recs.length, 1);
     assert.equal(recs[0].confidence, 0.9);
-    assert.equal(recs[0].projectedMonthlyCost, 0);
+    // Nothing is deleted without a copy: the archive backup of 4 × 100 GB stays, and is priced.
+    assert.equal(recs[0].projectedMonthlyCost, 400 * PRICES.snapshotArchive.aws);
+    assert.match(recs[0].details.explanation, /archive-tier snapshot of their disks \(kept for 1 year/);
+    assert.ok(recs[0].details.assumptions!.some((a) => /100 GB per instance/.test(a)));
     assert.match(recs[0].details.explanation, /network traffic \(in \+ out\) stayed under/);
     assert.deepEqual(recs[0].details.usage!.metrics, ["CPU", "network"]);
   });

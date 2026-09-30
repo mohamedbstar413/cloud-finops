@@ -3,15 +3,24 @@ import { DEMO_ACCOUNTS } from "../src/lib/demo/estate";
 import { demoSnapshot } from "../src/lib/connectors/demo";
 import { persistSnapshot } from "../src/lib/services/ingest";
 import { runAnalysis } from "../src/lib/services/analysis";
+import { hashPassword } from "../src/lib/security/password";
 
 const prisma = new PrismaClient();
 
+/**
+ * Seeds (or refreshes) the shared demo organization that visitors explore
+ * read-only from the sign-in page. Customer organizations are never touched.
+ * The seeded Acme users can sign in with SEED_PASSWORD (see .env).
+ */
 async function main() {
-  console.log("Resetting demo data…");
-  await prisma.organization.deleteMany();
-  await prisma.user.deleteMany();
+  console.log("Resetting the demo organization…");
+  await prisma.organization.deleteMany({ where: { isDemo: true } });
+  const emails = ["mohamed@acme.com", "sara@acme.com", "diego@acme.com", "priya@acme.com", "finance@acme.com"];
+  await prisma.user.deleteMany({ where: { email: { in: emails } } });
 
-  const org = await prisma.organization.create({ data: { name: "Acme Corp", plan: "pro" } });
+  const password = process.env.SEED_PASSWORD;
+  const passwordHash = password ? await hashPassword(password) : null;
+  const org = await prisma.organization.create({ data: { name: "Acme Corp", plan: "enterprise", isDemo: true, onboardedAt: new Date() } });
   const people = [
     { name: "Mohamed Abdelsattar", email: "mohamed@acme.com", role: "owner" },
     { name: "Sara Kim", email: "sara@acme.com", role: "admin" },
@@ -20,10 +29,10 @@ async function main() {
     { name: "Finance Viewer", email: "finance@acme.com", role: "viewer" },
   ];
   for (const p of people) {
-    const u = await prisma.user.create({ data: { name: p.name, email: p.email } });
+    const u = await prisma.user.create({ data: { name: p.name, email: p.email, passwordHash } });
     await prisma.membership.create({ data: { userId: u.id, orgId: org.id, role: p.role } });
   }
-  await prisma.invite.create({ data: { orgId: org.id, email: "cto@acme.com", role: "admin" } });
+  if (!passwordHash) console.log("  SEED_PASSWORD is not set: the Acme users cannot sign in (the read-only demo still works).");
 
   for (const spec of DEMO_ACCOUNTS) {
     const account = await prisma.cloudAccount.create({

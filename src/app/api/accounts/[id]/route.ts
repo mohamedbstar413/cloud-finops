@@ -2,7 +2,7 @@ import { z } from "zod";
 import { route, type Ctx } from "@/lib/api";
 import { audit, HttpError, requirePermission } from "@/lib/auth";
 import { prisma } from "@/lib/db";
-import { runAnalysis } from "@/lib/services/analysis";
+import { enqueue } from "@/lib/jobs/queue";
 
 const Body = z.object({ permissions: z.enum(["read_only", "read_write"]).optional(), name: z.string().min(1).max(80).optional() });
 
@@ -25,6 +25,6 @@ export const DELETE = route(async (_req: Request, ctx: Ctx<{ id: string }>) => {
   await prisma.cloudAccount.delete({ where: { id } });
   await prisma.recommendation.deleteMany({ where: { orgId: org.id, accountId: id } });
   await audit(org.id, user.name, "disconnected account", `${acct.provider.toUpperCase()} ${acct.name}`);
-  await runAnalysis(org.id);
+  await enqueue(org.id, "analyze", {}, { requestedBy: user.name });
   return { ok: true };
 });

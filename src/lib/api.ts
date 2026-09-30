@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { AIUnavailableError } from "./ai/client";
-import { HttpError } from "./auth";
+import { HttpError } from "./auth-errors";
 
 /** Uniform JSON error handling for route handlers. */
 export function route<A extends unknown[]>(fn: (...args: A) => Promise<unknown>) {

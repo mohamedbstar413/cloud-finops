@@ -338,7 +338,7 @@ export async function getOrganization(orgId: string) {
   const [org, audit, recs, accounts] = await Promise.all([
     prisma.organization.findUniqueOrThrow({
       where: { id: orgId },
-      include: { members: { include: { user: true }, orderBy: { createdAt: "asc" } }, invites: { orderBy: { createdAt: "desc" } } },
+      include: { members: { where: { user: { email: { not: "demo-viewer@cloudpriceoptimizer.dev" } } }, include: { user: true }, orderBy: { createdAt: "asc" } }, invites: { where: { acceptedAt: null }, orderBy: { createdAt: "desc" } } },
     }),
     prisma.auditLog.findMany({ where: { orgId }, orderBy: { createdAt: "desc" }, take: 25 }),
     prisma.recommendation.count({ where: { orgId, status: "applied" } }),
@@ -350,7 +350,7 @@ export async function getOrganization(orgId: string) {
     plan: org.plan,
     createdAt: org.createdAt.toISOString(),
     members: org.members.map((m) => ({ id: m.id, userId: m.userId, name: m.user.name, email: m.user.email, role: m.role, since: m.createdAt.toISOString() })),
-    invites: org.invites.map((i) => ({ id: i.id, email: i.email, role: i.role, createdAt: i.createdAt.toISOString() })),
+    invites: org.invites.map((i) => ({ id: i.id, email: i.email, role: i.role, createdAt: i.createdAt.toISOString(), expired: Boolean(i.expiresAt && i.expiresAt < new Date()) })),
     audit: audit.map((a) => ({ id: a.id, actor: a.actor, action: a.action, target: a.target, createdAt: a.createdAt.toISOString() })),
     stats: { applied: recs, accounts },
   };

@@ -12,12 +12,31 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// A customer (tenant). Every other record hangs off one organization.
+/// plan: free | pro | enterprise
 model Organization {
-  id              String           @id @default(cuid())
-  name            String
-  plan            String           @default("pro")
-  createdAt       DateTime         @default(now())
-  members         Membership[]
+  id                   String           @id @default(cuid())
+  name                 String
+  plan                 String           @default("free")
+  /// The shared, read-only demo organization visitors can explore without signing up.
+  isDemo               Boolean          @default(false)
+  /// JSON OrgSettings (remediation mode, backup retention, sync schedule, notifications, Git)
+  settings             String           @default("{}")
+  /// Per-tenant data key, wrapped by the platform master key (or KMS). Encrypts this org's credentials.
+  dataKey              String?
+  onboardedAt          DateTime?
+  nextSyncAt           DateTime?
+  stripeCustomerId     String?          @unique
+  stripeSubscriptionId String?
+  /// active | trialing | past_due | canceled
+  planStatus           String           @default("active")
+  /// Set when deletion is requested: the organization is inaccessible and its data is removed by a job.
+  deletedAt            DateTime?
+  createdAt            DateTime         @default(now())
+  members              Membership[]
+  sessions             Session[]
+  jobs                 Job[]
+  usageCounters        UsageCounter[]
   accounts        CloudAccount[]
   recommendations Recommendation[]
   scenarios       Scenario[]
@@ -27,11 +46,53 @@ model Organization {
 }
 
 model User {
-  id          String       @id @default(cuid())
-  name        String
-  email       String       @unique
-  createdAt   DateTime     @default(now())
-  memberships Membership[]
+  id              String          @id @default(cuid())
+  name            String
+  email           String          @unique
+  /// scrypt hash; null for users who were only invited and never signed up
+  passwordHash    String?
+  emailVerifiedAt DateTime?
+  createdAt       DateTime        @default(now())
+  memberships     Membership[]
+  sessions        Session[]
+  passwordResets  PasswordReset[]
+}
+
+/// A signed-in browser. The cookie holds a random token; only its SHA-256 is stored.
+model Session {
+  id         String       @id @default(cuid())
+  tokenHash  String       @unique
+  userId     String
+  /// The organization this session is working in (a user can belong to several; none right after
+  /// their only organization was deleted).
+  orgId      String?
+  createdAt  DateTime      @default(now())
+  expiresAt  DateTime
+  lastSeenAt DateTime      @default(now())
+  userAgent  String?
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org        Organization? @relation(fields: [orgId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+}
+
+model PasswordReset {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Failed sign-in attempts, for rate limiting (per email and per client address).
+model AuthAttempt {
+  id        String   @id @default(cuid())
+  key       String
+  createdAt DateTime @default(now())
+
+  @@index([key, createdAt])
 }
 
 /// role: owner | admin | member | viewer
@@ -48,12 +109,17 @@ model Membership {
 }
 
 model Invite {
-  id        String       @id @default(cuid())
-  orgId     String
-  email     String
-  role      String       @default("member")
-  createdAt DateTime     @default(now())
-  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  id         String       @id @default(cuid())
+  orgId      String
+  email      String
+  role       String       @default("member")
+  /// SHA-256 of the token in the invitation link
+  tokenHash  String?      @unique
+  invitedBy  String?
+  expiresAt  DateTime?
+  acceptedAt DateTime?
+  createdAt  DateTime     @default(now())
+  org        Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 }
 
 /// provider: aws | azure | gcp
@@ -243,4 +309,46 @@ model AnalysisRun {
   /// JSON DataGap[]
   gaps            String       @default("[]")
   org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+/// Background work: account syncs, analyses, scheduled syncs, organization deletion.
+/// type: sync_account | analyze | delete_org
+/// status: queued | running | succeeded | failed
+model Job {
+  id          String       @id @default(cuid())
+  orgId       String
+  type        String
+  /// JSON payload (e.g. { accountId })
+  payload     String       @default("{}")
+  status      String       @default("queued")
+  attempts    Int          @default(0)
+  maxAttempts Int          @default(3)
+  runAt       DateTime     @default(now())
+  lockedBy    String?
+  lockedAt    DateTime?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  error       String?
+  /// JSON result shown to the user
+  result      String?
+  /// Who asked for it ("System" for scheduled work)
+  requestedBy String?
+  createdAt   DateTime     @default(now())
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([status, runAt])
+  @@index([orgId, status])
+}
+
+/// Metered usage per organization and calendar month (e.g. ai_calls, manual_syncs).
+model UsageCounter {
+  id     String       @id @default(cuid())
+  orgId  String
+  metric String
+  /// YYYY-MM (UTC)
+  period String
+  count  Int          @default(0)
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, metric, period])
 }

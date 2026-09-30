@@ -1,13 +1,13 @@
 import { PageHeader } from "@/components/ui";
 import { aiEnabled } from "@/lib/ai/client";
-import { getSession } from "@/lib/auth";
+import { pageSession } from "@/lib/auth";
 import { prisma, parseJson } from "@/lib/db";
 import type { ArchitectureSpec, RecommendationDetails } from "@/lib/engine/types";
 import { getDashboard, orgGrowthRate } from "@/lib/services/queries";
 import { SavingsView, type SavingsRec } from "./view";
 
 export default async function SavingsPage({ searchParams }: { searchParams: Promise<{ rec?: string; mode?: string }> }) {
-  const { org } = await getSession();
+  const { org } = await pageSession();
   const sp = await searchParams;
   const [recs, dash, growthRate] = await Promise.all([
     prisma.recommendation.findMany({ where: { orgId: org.id, status: { in: ["open", "in_progress"] } }, orderBy: { monthlySavings: "desc" } }),

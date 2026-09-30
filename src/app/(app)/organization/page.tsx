@@ -1,26 +1,28 @@
 import { Check, Minus } from "lucide-react";
 import { Card, CardHeader, PageHeader, Pill } from "@/components/ui";
-import { can, getSession, PERMISSIONS, ROLES } from "@/lib/auth";
+import { can, pageSession, PERMISSIONS, ROLES } from "@/lib/auth";
 import { timeAgo } from "@/lib/format";
 import { getOrganization } from "@/lib/services/queries";
-import { InviteForm, MemberRoleSelect, RemoveInvite, ViewAsSwitcher } from "./members";
+import { InviteForm, MemberRoleSelect, RemoveInvite } from "./members";
 
 const PERM_LABEL: Record<string, string> = {
   "recommendation:act": "Apply, dismiss, snooze & ticket recommendations",
   "analysis:run": "Run analysis & sync accounts",
   "ai:use": "Use the AI advisor (what-if, deep-dives, discovery)",
   "account:manage": "Connect & manage cloud accounts",
-  "org:manage": "Manage members & roles",
+  "org:manage": "Manage members, roles & organization settings",
+  "billing:manage": "Change plan & billing",
+  "org:delete": "Export or delete the organization",
 };
 
 export default async function OrganizationPage() {
-  const { org, user, role } = await getSession();
+  const { org, user, role } = await pageSession();
   const o = await getOrganization(org.id);
   const manage = can(role, "org:manage");
 
   return (
     <>
-      <PageHeader title="Organization" subtitle={`${o.name} · ${o.plan} plan · ${o.members.length} members · ${o.stats.accounts} cloud accounts`} actions={<ViewAsSwitcher members={o.members.map((m) => ({ userId: m.userId, label: `${m.name} (${m.role})` }))} current={user.id} />} />
+      <PageHeader title="Organization" subtitle={`${o.name} · ${o.plan} plan · ${o.members.length} members · ${o.stats.accounts} cloud accounts`} />
 
       <div className="grid gap-4 xl:grid-cols-3">
         <Card className="xl:col-span-2">
@@ -55,6 +57,7 @@ export default async function OrganizationPage() {
                   <li key={i.id} className="flex items-center justify-between">
                     <span>
                       {i.email} <Pill className="ml-2 bg-slate-100 capitalize text-slate-600 ring-slate-200">{i.role}</Pill>
+                      {i.expired && <Pill className="ml-1 bg-amber-50 text-amber-700 ring-amber-200">expired</Pill>}
                     </span>
                     {manage && <RemoveInvite id={i.id} />}
                   </li>
@@ -62,7 +65,7 @@ export default async function OrganizationPage() {
               </ul>
             </div>
           )}
-          {manage && (
+          {manage && !org.isDemo && (
             <div className="border-t border-line px-5 py-4">
               <InviteForm canInviteOwner={role === "owner"} />
             </div>

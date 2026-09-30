@@ -2,7 +2,7 @@ import { Info, TriangleAlert } from "lucide-react";
 import { Fragment } from "react";
 import { ProviderLogo } from "@/components/ProviderLogo";
 import { Card, PageHeader, Pill } from "@/components/ui";
-import { can, getSession } from "@/lib/auth";
+import { can, pageSession } from "@/lib/auth";
 import { DEMO_ACCOUNTS } from "@/lib/demo/estate";
 import { timeAgo, usd } from "@/lib/format";
 import type { Provider } from "@/lib/pricing/catalog";
@@ -13,7 +13,7 @@ const TITLES: Record<Provider, string> = { aws: "AWS", azure: "Azure", gcp: "Goo
 const ID_LABEL: Record<Provider, string> = { aws: "Account ID", azure: "Subscription ID", gcp: "Project ID" };
 
 export default async function AccountsPage() {
-  const { org, role } = await getSession();
+  const { org, role } = await pageSession();
   const accounts = await listAccounts(org.id);
   const manage = can(role, "account:manage");
   const sync = can(role, "analysis:run");

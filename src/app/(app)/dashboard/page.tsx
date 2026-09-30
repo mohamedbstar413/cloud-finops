@@ -5,7 +5,9 @@ import { PeriodSelect } from "@/components/PeriodSelect";
 import { TopRecCard } from "@/components/RecCards";
 import { Card, CardHeader, Empty, LinkButton, PageHeader, Stat } from "@/components/ui";
 import { aiEnabled } from "@/lib/ai/client";
-import { getSession } from "@/lib/auth";
+import { redirect } from "next/navigation";
+import { can, pageSession } from "@/lib/auth";
+import { prisma } from "@/lib/db";
 import { CATEGORY_LABEL, usd } from "@/lib/format";
 import { getDashboard } from "@/lib/services/queries";
 
@@ -16,7 +18,9 @@ const PROMPTS = [
 ];
 
 export default async function DashboardPage({ searchParams }: { searchParams: Promise<{ days?: string }> }) {
-  const { org } = await getSession();
+  const { org, role } = await pageSession();
+  // A new organization starts with onboarding; people who cannot connect accounts see the empty dashboard.
+  if (!org.isDemo && can(role, "account:manage") && (await prisma.cloudAccount.count({ where: { orgId: org.id } })) === 0) redirect("/onboarding");
   const days = [7, 30, 60, 90].includes(Number((await searchParams).days)) ? Number((await searchParams).days) : 30;
   const d = await getDashboard(org.id, days);
   const maxCat = Math.max(1, ...d.savingsByCategory.map((c) => c.savings));

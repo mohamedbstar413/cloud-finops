@@ -424,10 +424,12 @@ data "aws_instances" "${p.tagValue}" {
 `;
 }
 
-export function tfSnapshotArchive() {
-  return `# Move snapshots older than 90 days to the archive tier; expire after 1 year
+export function tfSnapshotArchive(p: { retentionDays: number | null } = { retentionDays: 365 }) {
+  const keep = p.retentionDays === null ? "until deleted by hand" : `for ${p.retentionDays} days`;
+  return `# Move snapshots older than 90 days to the archive tier, and keep them there ${keep}
+# (your organization's backup retention setting)
 resource "aws_dlm_lifecycle_policy" "archive" {
-  description        = "Archive and expire old EBS snapshots"
+  description        = "Archive old EBS snapshots"
   execution_role_arn = aws_iam_role.dlm.arn
   state              = "ENABLED"
 
@@ -444,8 +446,7 @@ resource "aws_dlm_lifecycle_policy" "archive" {
       archive_rule {
         archive_retain_rule {
           retention_archive_tier {
-            interval      = 365
-            interval_unit = "DAYS"
+${p.retentionDays === null ? "            # No expiry: archived snapshots are kept until someone deletes them.\n            count = 1000" : `            interval      = ${p.retentionDays}\n            interval_unit = "DAYS"`}
           }
         }
       }

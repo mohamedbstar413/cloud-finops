@@ -1,11 +1,11 @@
 import { PageHeader } from "@/components/ui";
-import { getSession } from "@/lib/auth";
+import { pageSession } from "@/lib/auth";
 import { getDataCoverage, listRecommendations } from "@/lib/services/queries";
 import { RecommendationsNav } from "../nav";
 import { RecommendationHistory } from "../view";
 
 export default async function RecommendationHistoryPage() {
-  const { org } = await getSession();
+  const { org } = await pageSession();
   const [recs, coverage] = await Promise.all([listRecommendations(org.id), getDataCoverage(org.id)]);
   return (
     <>

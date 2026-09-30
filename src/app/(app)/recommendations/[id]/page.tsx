@@ -1,11 +1,11 @@
 import { notFound } from "next/navigation";
 import { aiEnabled } from "@/lib/ai/client";
-import { can, getSession } from "@/lib/auth";
+import { can, pageSession } from "@/lib/auth";
 import { getRecommendation, orgGrowthRate } from "@/lib/services/queries";
 import { RecommendationDetail } from "./detail";
 
 export default async function RecommendationPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ tab?: string }> }) {
-  const { org, role } = await getSession();
+  const { org, role } = await pageSession();
   const { id } = await params;
   const data = await getRecommendation(org.id, id);
   if (!data) notFound();

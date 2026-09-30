@@ -2,13 +2,13 @@ import { ArrowDown, ArrowUp } from "lucide-react";
 import { CategoryStackedBar, Legend, ProviderDonut, providerLegend, Sparkline, SpendTrendChart } from "@/components/charts";
 import { ProviderLogo } from "@/components/ProviderLogo";
 import { Card, CardHeader, Empty, PageHeader, Stat } from "@/components/ui";
-import { getSession } from "@/lib/auth";
+import { pageSession } from "@/lib/auth";
 import { CATEGORY_LABEL, PROVIDER_COLOR, PROVIDER_NAME, usd } from "@/lib/format";
 import { getCostExplorer, parseCostFilters } from "@/lib/services/queries";
 import { CostFilterBar, ExportButton, PeriodFilter, ProviderTabs } from "./filters";
 
 export default async function CostExplorerPage({ searchParams }: { searchParams: Promise<Record<string, string | undefined>> }) {
-  const { org } = await getSession();
+  const { org } = await pageSession();
   const sp = await searchParams;
   const filters = parseCostFilters(sp);
   const d = await getCostExplorer(org.id, filters);

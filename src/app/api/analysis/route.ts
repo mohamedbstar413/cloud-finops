@@ -1,10 +1,11 @@
 import { route } from "@/lib/api";
 import { audit, requirePermission } from "@/lib/auth";
-import { runAnalysis } from "@/lib/services/analysis";
+import { enqueue } from "@/lib/jobs/queue";
 
+/** Re-analyse the organization in the background; the client follows the returned job. */
 export const POST = route(async () => {
   const { org, user } = await requirePermission("analysis:run");
-  const result = await runAnalysis(org.id);
-  await audit(org.id, user.name, "ran analysis", `${result.recommendations} recommendations`);
-  return result;
+  const job = await enqueue(org.id, "analyze", {}, { requestedBy: user.name });
+  await audit(org.id, user.name, "requested analysis");
+  return { job };
 });

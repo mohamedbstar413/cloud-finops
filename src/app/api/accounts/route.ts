@@ -1,13 +1,22 @@
 import { z } from "zod";
 import { route } from "@/lib/api";
 import { audit, getSession, HttpError, requirePermission } from "@/lib/auth";
-import { encryptJson } from "@/lib/crypto";
+import { assertCanAddAccount } from "@/lib/billing/limits";
 import { prisma } from "@/lib/db";
 import { DEMO_ACCOUNTS } from "@/lib/demo/estate";
-import { syncAccount, validateCredentials } from "@/lib/services/ingest";
+import { enqueue } from "@/lib/jobs/queue";
+import { validateCredentials } from "@/lib/services/ingest";
 import { listAccounts } from "@/lib/services/queries";
+import { encryptForOrg } from "@/lib/tenant-crypto";
 
-export const maxDuration = 300;
+export const maxDuration = 60;
+
+/** Sync the new account, then analyse — both in the background. */
+async function firstSync(orgId: string, accountId: string, by: string) {
+  const job = await enqueue(orgId, "sync_account", { accountId }, { requestedBy: by });
+  await enqueue(orgId, "analyze", {}, { requestedBy: by });
+  return job;
+}
 
 export const GET = route(async () => {
   const { org } = await getSession();
@@ -46,6 +55,7 @@ const Body = z.discriminatedUnion("provider", [
 export const POST = route(async (req: Request) => {
   const { org, user } = await requirePermission("account:manage");
   const body = Body.parse(await req.json());
+  if (body.provider !== "demo") await assertCanAddAccount(org.id);
 
   if (body.provider === "demo") {
     const spec = DEMO_ACCOUNTS.find((a) => a.key === body.key);
@@ -55,9 +65,9 @@ export const POST = route(async (req: Request) => {
     const account = await prisma.cloudAccount.create({
       data: { orgId: org.id, provider: spec.provider, name: spec.name, externalId: spec.externalId, region: spec.region, authType: spec.authType, isDemo: true, status: "pending" },
     });
-    const sync = await syncAccount(account.id);
-    await audit(org.id, user.name, "connected account", `${spec.provider.toUpperCase()} ${spec.name} (demo)`);
-    return { account: { id: account.id }, sync };
+    const job = await firstSync(org.id, account.id, user.name);
+    await audit(org.id, user.name, "connected account", `${spec.provider.toUpperCase()} ${spec.name} (sample data)`);
+    return { account: { id: account.id }, job };
   }
 
   const { name, region } = body;
@@ -87,9 +97,9 @@ export const POST = route(async (req: Request) => {
   if (!check.ok) throw new HttpError(422, `Connection test failed: ${check.message}`);
 
   const account = await prisma.cloudAccount.create({
-    data: { orgId: org.id, provider: body.provider, name, externalId, region, authType, credentials: encryptJson(creds), status: "pending" },
+    data: { orgId: org.id, provider: body.provider, name, externalId, region, authType, credentials: await encryptForOrg(org.id, creds), status: "pending" },
   });
   await audit(org.id, user.name, "connected account", `${body.provider.toUpperCase()} ${name}`);
-  const sync = await syncAccount(account.id);
-  return { account: { id: account.id }, identity: check.identity, sync };
+  const job = await firstSync(org.id, account.id, user.name);
+  return { account: { id: account.id }, identity: check.identity, job };
 });

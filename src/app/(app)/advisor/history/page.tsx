@@ -1,11 +1,11 @@
 import { PageHeader } from "@/components/ui";
-import { getSession } from "@/lib/auth";
+import { pageSession } from "@/lib/auth";
 import { listScenarios } from "@/lib/services/scenarios";
 import { AdvisorNav } from "../nav";
 import { ScenarioList } from "../view";
 
 export default async function ScenarioHistoryPage() {
-  const { org } = await getSession();
+  const { org } = await pageSession();
   const scenarios = await listScenarios(org.id);
   return (
     <>

@@ -1,6 +1,7 @@
 import { prisma } from "../db";
 import { runEngineWithCoverage, totalPotentialSavings } from "../engine";
 import type { RecommendationDraft } from "../engine/types";
+import { parseSettings } from "../settings";
 import { loadEstate } from "./estate";
 
 export function draftToRow(orgId: string, d: RecommendationDraft) {
@@ -37,11 +38,13 @@ export function draftToRow(orgId: string, d: RecommendationDraft) {
  * (dismiss / snooze / apply) and AI enrichment across runs.
  */
 export async function runAnalysis(orgId: string) {
-  const estate = await loadEstate(orgId);
+  const [loaded, org] = await Promise.all([loadEstate(orgId), prisma.organization.findUniqueOrThrow({ where: { id: orgId }, select: { settings: true } })]);
+  const estate = { ...loaded, policy: { backupRetentionDays: parseSettings(org.settings).backups.retentionDays } };
   const { drafts, gaps, coverage } = runEngineWithCoverage(estate);
   const existing = await prisma.recommendation.findMany({ where: { orgId, source: "engine" } });
   const byFp = new Map(existing.map((r) => [r.fingerprint, r]));
   const seen = new Set<string>();
+  const created: { title: string; monthlySavings: number; impact: string }[] = [];
 
   for (const d of drafts) {
     seen.add(d.fingerprint);
@@ -51,6 +54,7 @@ export async function runAnalysis(orgId: string) {
       await prisma.recommendation.update({ where: { id: prev.id }, data: row });
     } else {
       await prisma.recommendation.create({ data: row });
+      created.push({ title: d.title, monthlySavings: d.monthlySavings, impact: d.impact ?? "low" });
     }
   }
 
@@ -81,6 +85,8 @@ export async function runAnalysis(orgId: string) {
     monthlySavings,
     heldBack: gaps.length,
     coverage,
+    /** Recommendations that did not exist before this run. */
+    created,
   };
 }
 

@@ -6,14 +6,22 @@
  */
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { rmSync } from "node:fs";
 import { after, before, describe, it } from "node:test";
 
 // Runs on a throwaway SQLite file by default; set TEST_POSTGRES_URL (with the Postgres client generated)
-// to run the same tests against PostgreSQL.
+// to run the same tests against PostgreSQL. Each Postgres run gets its own schema, dropped afterwards,
+// so existing data in that database is never touched.
 const PG = process.env.TEST_POSTGRES_URL;
 const DB_FILE = `test-saas-${process.pid}.db`;
-process.env.DATABASE_URL = PG ?? `file:./${DB_FILE}`;
+const PG_SCHEMA = `test_saas_${process.pid}`;
+const pgUrl = (url: string) => {
+  const u = new URL(url);
+  u.searchParams.set("schema", PG_SCHEMA);
+  return u.toString();
+};
+process.env.DATABASE_URL = PG ? pgUrl(PG) : `file:./${DB_FILE}`;
 (process.env as Record<string, string>).NODE_ENV = "test";
 
 type Mods = {
@@ -35,7 +43,7 @@ type Mods = {
 let m: Mods;
 
 before(async () => {
-  execSync(PG ? "npx prisma db push --skip-generate --force-reset --accept-data-loss --schema prisma/postgres/schema.prisma" : "npx prisma db push --skip-generate --accept-data-loss", {
+  execSync(PG ? "npx prisma db push --skip-generate --schema prisma/postgres/schema.prisma" : "npx prisma db push --skip-generate --accept-data-loss", {
     env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL },
     stdio: "ignore",
   });
@@ -58,6 +66,7 @@ before(async () => {
 });
 
 after(async () => {
+  if (PG) await m?.prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${PG_SCHEMA}" CASCADE`);
   await m?.prisma.$disconnect();
   if (!PG) for (const f of [DB_FILE, `${DB_FILE}-journal`]) rmSync(`prisma/${f}`, { force: true });
 });
@@ -239,6 +248,44 @@ describe("per-tenant encryption", () => {
     assert.ok(stored.dataKey?.startsWith("v1."));
     // Credentials stored before per-tenant keys existed still decrypt.
     assert.deepEqual(await m.crypto.decryptForOrg(a.org.id, m.legacy.encryptJson(secret)), secret);
+  });
+
+  it("rotates the master key by re-wrapping data keys, and moves legacy credentials to the organization's key", async () => {
+    const { org } = await signUp();
+    const current = process.env.ENCRYPTION_KEY;
+    const next = randomBytes(32).toString("hex");
+    const account = (name: string, credentials: string) =>
+      m.prisma.cloudAccount.create({ data: { orgId: org.id, provider: "azure", name, externalId: uniq(), region: "eastus", authType: "service_principal", credentials } });
+    const modernBlob = await m.crypto.encryptForOrg(org.id, { clientSecret: "modern" });
+    const modern = await account("Modern", modernBlob);
+    const legacy = await account("Legacy", m.legacy.encryptJson({ clientSecret: "legacy" }));
+
+    const r = await m.crypto.rotateMasterKey(current, next);
+    assert.ok(r.rewrapped >= 1);
+    assert.equal(r.credentialsUpgraded, 1);
+    const reread = (id: string) => m.prisma.cloudAccount.findUniqueOrThrow({ where: { id } }).then((a) => a.credentials!);
+    assert.equal(await reread(modern.id), modernBlob, "credentials under a data key are not re-encrypted");
+    const upgraded = await reread(legacy.id);
+    assert.ok(upgraded.startsWith(`v2.${org.id}.`));
+    // The old master key no longer opens the organization's data key.
+    await assert.rejects(m.crypto.decryptForOrg(org.id, modernBlob));
+    process.env.ENCRYPTION_KEY = next;
+    try {
+      m.crypto.forgetOrgKey();
+      assert.deepEqual(await m.crypto.decryptForOrg(org.id, modernBlob), { clientSecret: "modern" });
+      assert.deepEqual(await m.crypto.decryptForOrg(org.id, upgraded), { clientSecret: "legacy" });
+      // A second run (e.g. after an interruption) finds nothing left to do.
+      const again = await m.crypto.rotateMasterKey(current, next);
+      assert.equal(again.rewrapped + again.credentialsUpgraded, 0);
+      assert.ok(again.alreadyCurrent >= 1);
+    } finally {
+      // Put every organization back on the original key for the tests that follow.
+      await m.crypto.rotateMasterKey(next, current);
+      if (current === undefined) delete process.env.ENCRYPTION_KEY;
+      else process.env.ENCRYPTION_KEY = current;
+      m.crypto.forgetOrgKey();
+    }
+    assert.deepEqual(await m.crypto.decryptForOrg(org.id, modernBlob), { clientSecret: "modern" });
   });
 });
 
